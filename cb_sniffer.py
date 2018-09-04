@@ -8,7 +8,8 @@ import argparse
 #python3
 #3.6.5
 
-class Genomicpostions:
+
+class GenomiPostion:
 
     def __init__(self, line):
         """
@@ -46,6 +47,11 @@ class Genomicpostions:
 
     @classmethod
     def good_barcodes(cls,f):
+        """
+
+        :param f: good barcodes file
+        :return: dict with good barcodes
+        """
         barc = {}
         with open(f, 'r') as barcodes:
             for line in barcodes:
@@ -54,6 +60,16 @@ class Genomicpostions:
         return barc
 
     def count_barcodes(self, bam_fil, bar, indel, mapq, baseq):
+        """
+
+        :param bam_fil: bam_file
+        :param bar: good barcodes dict
+        :param indel: SNP = 0 indel= int(window size) insertion or deletion
+        :param mapq: mapping quality
+        :param baseq: base quality
+        :return: two dicts 1) list of all barcodes at given var pos
+        2) dict with ref and alt barcodes
+        """
         barcodes = defaultdict(list)  # CB
         # ======================================
         barUcodes = defaultdict(list)  # UB
