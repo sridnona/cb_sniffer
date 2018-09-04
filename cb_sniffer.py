@@ -9,7 +9,7 @@ import argparse
 #3.6.5
 
 
-class GenomiPostion:
+class GenomicPostion:
 
     def __init__(self, line):
         """
