@@ -3,10 +3,16 @@ import pysam
 import logging as logger
 import sys
 import argparse
-#print(pysam.__version__)
-#0.14.1
-#python3
-#3.6.5
+
+# #f = '/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
+# # f='/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
+# # f = '/Users/sid/10x_new/scripts/flt3.tsv'
+# f = '/Users/sid/Documents/scripts/scrnaseq/721214.variants.GRCh38.tsv'
+# # bam_file = '/Users/sid/Documents/scripts/scrnaseq/ALDH16A1_721214.bam'
+# # bar_file = '/Users/sid/Documents/scripts/scrnaseq/721214_barcodes.tsv'
+# # # UPN name as outfile prefix
+# # outfile = "809"
+
 
 class Genomicpostions:
 
@@ -44,7 +50,8 @@ class Genomicpostions:
             elif self.ref == '-':  # insertion
                return len(self.alt)
 
-    def good_barcodes(self,f):
+    @classmethod
+    def good_barcodes(cls,f):
         barc = {}
         with open(f, 'r') as barcodes:
             for line in barcodes:
@@ -52,7 +59,7 @@ class Genomicpostions:
                 barc[lines] = 1
         return barc
 
-    def count_barcodes(self,bam_fil, bar, indel, mapq, baseq):
+    def count_barcodes(self, bam_fil, bar, indel, mapq, baseq):
         barcodes = defaultdict(list)  # CB
         # ======================================
         barUcodes = defaultdict(list)  # UB
@@ -265,7 +272,7 @@ class Genomicpostions:
                 Uunc=Uuni_alt_c)
         # print(snp)
         wt.write(snp)
-        logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
+        logger.info("completed processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
             self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
         return snp
 
@@ -301,6 +308,7 @@ if __name__ == '__main__':
 
     num_lines_barcode = sum(1 for lines in open(barcodes_good))
     logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
+    bars = Genomicpostions.good_barcodes(barcodes_good)
     with open(outfile + '_AllCounts.tsv', 'w+') as var, \
             open(outfile + '_counts_CB.tsv', 'w+') as CB, \
             open(outfile + '_counts_UB.tsv', 'w+') as UB, \
@@ -320,11 +328,12 @@ if __name__ == '__main__':
                      'gene', 'barcode', 'ref_count', 'alt_count', 'total_UB']
         UB_h = '\t'.join(UB_header) + '\n'
         UB.write(UB_h)
+
         next(regions)
         for lines in regions:
             x = Genomicpostions(lines)
-            bars = x.good_barcodes(barcodes_good)
-            # print(x.chrm, x.start, x.event, x.gene, x.classify())
+
+            print(x.chrm, x.start, x.event, x.gene, x.classify())
             barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
             # print(check_classify[0])
             counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
