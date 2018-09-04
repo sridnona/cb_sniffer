@@ -9,10 +9,6 @@ import argparse
 #3.6.5
 
 class Genomicpostions:
-    logger.basicConfig(filename=outfile + '.log', filemode='w+',
-                       level=logger.DEBUG,
-                       format='%(asctime)s %(levelname)s %(message)s')
-    logger.info("Start process")
 
     def __init__(self, line):
         """
@@ -296,7 +292,15 @@ if __name__ == '__main__':
     counts = args.filter
     bq = args.baseq
     mq = args.mapq
+    logger.basicConfig(filename=outfile + '.log', filemode='w+',
+                       level=logger.DEBUG,
+                       format='%(asctime)s %(levelname)s %(message)s')
+    logger.info("Start process")
+    num_lines_variants = sum(1 for line in open(variants)) - 1  # minus header
+    logger.info("Number of variants:\t{}".format(num_lines_variants))
 
+    num_lines_barcode = sum(1 for lines in open(barcodes_good))
+    logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
     with open(outfile + '_AllCounts.tsv', 'w+') as var, \
             open(outfile + '_counts_CB.tsv', 'w+') as CB, \
             open(outfile + '_counts_UB.tsv', 'w+') as UB, \
