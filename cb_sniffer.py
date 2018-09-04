@@ -3,7 +3,10 @@ import pysam
 import logging as logger
 import sys
 import argparse
-
+#print(pysam.__version__)
+#0.14.1
+#python3
+#3.6.5
 
 class Genomicpostions:
     logger.basicConfig(filename=outfile + '.log', filemode='w+',
