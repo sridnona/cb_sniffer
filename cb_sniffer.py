@@ -4,15 +4,6 @@ import logging as logger
 import sys
 import argparse
 
-# #f = '/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-# # f='/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-# # f = '/Users/sid/10x_new/scripts/flt3.tsv'
-# f = '/Users/sid/Documents/scripts/scrnaseq/721214.variants.GRCh38.tsv'
-# # bam_file = '/Users/sid/Documents/scripts/scrnaseq/ALDH16A1_721214.bam'
-# # bar_file = '/Users/sid/Documents/scripts/scrnaseq/721214_barcodes.tsv'
-# # # UPN name as outfile prefix
-# # outfile = "809"
-
 
 class Genomicpostions:
     logger.basicConfig(filename=outfile + '.log', filemode='w+',
@@ -281,15 +272,6 @@ class Genomicpostions:
 
 
 if __name__ == '__main__':
-    # # f = '/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-    # # f='/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-    # # f = '/Users/sid/10x_new/scripts/flt3.tsv'
-    # outfile = 'class_time'
-    # f = '/Users/sid/Documents/scripts/scrnaseq/721214.variants.GRCh38.tsv'
-    # bam_file = '/Users/sid/Documents/scripts/scrnaseq/ALDH16A1_721214.bam'
-    # bar_file = '/Users/sid/Documents/scripts/scrnaseq/721214_barcodes.tsv'
-    # # # UPN name as outfile prefix
-    # # outfile = "809"
     parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
     parser.add_argument('bam_file', help='BAM file')
     parser.add_argument('variant_file', help='variants file with header')
@@ -335,7 +317,7 @@ if __name__ == '__main__':
         for lines in regions:
             x = Genomicpostions(lines)
             bars = x.good_barcodes(barcodes_good)
-            print(x.chrm, x.start, x.event, x.gene, x.classify())
+            # print(x.chrm, x.start, x.event, x.gene, x.classify())
             barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
             # print(check_classify[0])
             counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
