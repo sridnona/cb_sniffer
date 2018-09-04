@@ -3,16 +3,10 @@ import pysam
 import logging as logger
 import sys
 import argparse
-
-# #f = '/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-# # f='/Users/sid/10x_new/scripts/782328.variants.GRCh38.tsv'
-# # f = '/Users/sid/10x_new/scripts/flt3.tsv'
-# f = '/Users/sid/Documents/scripts/scrnaseq/721214.variants.GRCh38.tsv'
-# # bam_file = '/Users/sid/Documents/scripts/scrnaseq/ALDH16A1_721214.bam'
-# # bar_file = '/Users/sid/Documents/scripts/scrnaseq/721214_barcodes.tsv'
-# # # UPN name as outfile prefix
-# # outfile = "809"
-
+#print(pysam.__version__)
+#0.14.1
+#python3
+#3.6.5
 
 class Genomicpostions:
 
