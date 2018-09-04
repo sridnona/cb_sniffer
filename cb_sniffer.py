@@ -263,7 +263,7 @@ class Genomicpostions:
                 Uuvaf=uvU,
                 umi=CBfin_umi,
                 Uunc=Uuni_alt_c)
-        print(snp)
+        # print(snp)
         wt.write(snp)
         logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
             self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
