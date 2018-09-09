@@ -35,3 +35,10 @@ Dependencies
 python3  
 pysam  
 
+Docker image
+----------
+sridnona/python3:180909.v1
+
+```{shell}
+LSF_DOCKER_PRESERVE_ENVIRONMENT=false bsub -Is -q research-hpc -a "docker(sridnona/python3:180909.v1)" /bin/bash
+```
