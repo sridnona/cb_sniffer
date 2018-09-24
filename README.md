@@ -34,7 +34,22 @@ optional arguments:
 chrm	start	stop	ref	var	gene_name	trv_type
 19	4xxx	4xxx	G	A	gene_name	silent/misense/frame_shift  
 ```
-	
+
+#### barcodes
+```{shell}
+AACCTGAGAATGTTG-1
+AAACCTGAGCTACCGC-1
+AAACCTGAGCTGCCCA-1
+AAACCTGAGGTCGGAT-1
+AAACCTGAGTACGATA-1
+AAACCTGAGTGCAAGC-1
+AAACCTGAGTGCCATT-1
+AAACCTGAGTGGAGTC-1
+AAACCTGCAAAGTGCG-1
+AAACCTGCATAAGACA-1
+```
+
+
 Dependencies
 -------
 
