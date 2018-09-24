@@ -27,8 +27,14 @@ optional arguments:
                         Skip read with mapq smaller than default : 0
   -bq BASEQ, --baseq BASEQ
                         Skip bases with base quality less than default : 1
-```
 
+```
+#### Variant file 
+```{shell}
+chrm	start	stop	ref	var	gene_name	trv_type
+19	4xxx	4xxx	G	A	gene_name	silent/misense/frame_shift  
+```
+	
 Dependencies
 -------
 
