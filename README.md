@@ -1,4 +1,4 @@
-10x_singlecell 
+cb_sniffer 
 =============
 
 Mutation barcode caller,  calls mutant and ref barcodes from 10x single cell data   
