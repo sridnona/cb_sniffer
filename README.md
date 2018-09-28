@@ -52,10 +52,11 @@ AAACCTGCATAAGACA-1
 ### Output files 
     1. variant list with barcodes supporting a variant :_AllCounts.tsv
     2. read counts for Chromium cellular barcode sequence(CB_tag) : _counts_CB.tsv
-    3. read counts for Chromium molecular barcode(UB_tag): _counts_UB.tsv
+    3. read counts for Chromium molecular barcode(UB_tag): _counts_UB.tsv  
 
-    * Additional info on tags
-    [bam_tags](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/output/bam)
+
+* Additional info on tags
+[bam_tags](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/output/bam)
 
 
 
