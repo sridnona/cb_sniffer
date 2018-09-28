@@ -55,8 +55,7 @@ AAACCTGCATAAGACA-1
     3. read counts for Chromium molecular barcode(UB_tag): _counts_UB.tsv
 
     * Additional info on tags
-    -----------------------
-    <https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/output/bam>
+    [bam_tags](https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/output/bam)
 
 
 
