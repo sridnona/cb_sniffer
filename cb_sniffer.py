@@ -9,7 +9,7 @@ import argparse
 #3.6.5
 
 
-class GenomicPostion:
+class GenomicPosition:
 
     def __init__(self, line):
         """
@@ -318,7 +318,7 @@ if __name__ == '__main__':
 
     num_lines_barcode = sum(1 for lines in open(barcodes_good))
     logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
-    bars = Genomicpostions.good_barcodes(barcodes_good)
+    bars = GenomicPosition.good_barcodes(barcodes_good)
     with open(outfile + '_AllCounts.tsv', 'w+') as var, \
             open(outfile + '_counts_CB.tsv', 'w+') as CB, \
             open(outfile + '_counts_UB.tsv', 'w+') as UB, \
@@ -341,7 +341,7 @@ if __name__ == '__main__':
 
         next(regions)
         for lines in regions:
-            x = GenomicPostion(lines)
+            x = GenomicPosition(lines)
 
             print(x.chrm, x.start, x.event, x.gene, x.classify())
             barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
