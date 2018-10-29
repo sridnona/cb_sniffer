@@ -341,7 +341,7 @@ if __name__ == '__main__':
 
         next(regions)
         for lines in regions:
-            x = Genomicpostions(lines)
+            x = GenomicPostion(lines)
 
             print(x.chrm, x.start, x.event, x.gene, x.classify())
             barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
