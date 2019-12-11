@@ -11,24 +11,36 @@ import argparse
 
 class GenomicPosition:
 
-    def __init__(self, line):
+    def __init__(self, line, vcf=False):
         """
         :param line:
          for each variant holds genomics positions
          and other informations
         """
-        region = line.strip().split('\t')
-        if len(region) < 7:
-            logger.debug("Insufficient columns fields please check variant file")
-            sys.exit(1)
-        self.chrm = region[0]
-        self.start = int(region[1])
-        self.end = int(region[2])
-        self.ref = region[3]
-        self.alt = region[4]
-        self.gene = region[5]  # gene name
-        self.event = region[6]  #
-        # print(self, self.chrm, self.start, self.event)
+        if vcf == True:
+            region = line.strip().split('\t')
+            if len(region) < 5:
+                logger.debug("Insufficient columns fields please check variant file")
+                sys.exit(1)
+            self.chrm = region.chrom
+            self.start = int(region.pos)
+            self.end = int(region.id)
+            self.ref = region.alleles[0]
+            self.alt = region.alleles[4]
+            # print(self, self.chrm, self.start, self.event)
+        else:
+            region = line.strip().split('\t')
+            if len(region) < 7:
+                logger.debug("Insufficient columns fields please check variant file")
+                sys.exit(1)
+            self.chrm = region[0]
+            self.start = int(region[1])
+            self.end = int(region[2])
+            self.ref = region[3]
+            self.alt = region[4]
+            self.gene = region[5]  # gene name
+            self.event = region[6]  #
+            # print(self, self.chrm, self.start, self.event)
 
     def classify(self):
         """
@@ -76,7 +88,7 @@ class GenomicPosition:
         bar_count = {'ref': [], 'alt': []}  # UB
         with pysam.AlignmentFile(bam_fil, 'rb') as pile:
             logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
-                self.chrm,self.start, self.end, self.ref, self.alt, self.gene, self.event))
+                self.chrm,self.start, self.end, self.ref, self.alt))
 
             for pileupcolumn in pile.pileup(reference=self.chrm, start=self.start - 1, end=self.start,
                                             truncate=True, stepper="nofilter", max_depth=100000000):
@@ -160,7 +172,7 @@ class GenomicPosition:
                 uniqub_barcodes_raw.add(sampleru)
         # UB ====================================================================================================
         logger.info("Consensus calc variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
-            self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
+            self.chrm, self.start, self.end, self.ref, self.alt))
         d = {}
         UBuniq_barcodes_raw = []
         for utags in uniqub_barcodes_raw:
@@ -207,8 +219,21 @@ class GenomicPosition:
 
             if un1alt:  # append only alt barcodes that have 1
                 UBuniq_barcodes_raw.append(utags)
-
-            ubtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
+            if vcf == True:
+                ubtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
+                      '{type}\t{gene}\t{bar}\t{r}\t{v}\t{tot}\n'.format(
+                        chrm=self.chrm,
+                        st=self.start,
+                        en=self.end,
+                        ref=self.ref,
+                        alt=self.alt,
+                        type=self.event,
+                        gene=self.gene,
+                        bar=utags,
+                        r=unref,
+                        v=unalt, tot=utotl)
+            else:
+                ubtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
                       '{type}\t{gene}\t{bar}\t{r}\t{v}\t{tot}\n'.format(
                         chrm=self.chrm,
                         st=self.start,
@@ -240,7 +265,20 @@ class GenomicPosition:
             uni_alt.append(v['alt'])
             tot1 = v['alt'] + v['ref']
             tuni_alt.append(tot1)
-            cbtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
+            if vcf == True:
+                cbtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
+                      '{bar}\t{ref1}\t{alt1}\t{tot}\n'.format(
+                        chrm=self.chrm,
+                        st=self.start,
+                        en=self.end,
+                        ref=self.ref,
+                        alt=self.alt,
+                        bar=i,
+                        alt1=v['alt'],
+                        ref1=v['ref'],
+                        tot=tot1)
+            else:
+                cbtager = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t' \
                       '{type}\t{gene}\t{bar}\t{ref1}\t{alt1}\t{tot}\n'.format(
                         chrm=self.chrm,
                         st=self.start,
@@ -266,7 +304,21 @@ class GenomicPosition:
         except ZeroDivisionError:
             uvU = float(0.0)
 
-        snp = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t{type}\t{gene}' \
+        if vcf == True:
+            snp = '{chrm}\t{st}\t{en}\t{ref}\t{alt}' \
+              '\t{Uunidepth}\t{Uunc}\t{Uuvaf}\t{umi}\t{Uumi}\n'.format(
+                chrm=self.chrm,
+                st=self.start,
+                en=self.end,
+                ref=self.ref,
+                alt=self.alt,
+                Uunidepth=tUuni_alt_c,
+                Uumi=UBfin_umi,
+                Uuvaf=uvU,
+                umi=CBfin_umi,
+                Uunc=Uuni_alt_c)
+        else:
+            snp = '{chrm}\t{st}\t{en}\t{ref}\t{alt}\t{type}\t{gene}' \
               '\t{Uunidepth}\t{Uunc}\t{Uuvaf}\t{umi}\t{Uumi}\n'.format(
                 chrm=self.chrm,
                 st=self.start,
@@ -283,7 +335,7 @@ class GenomicPosition:
         # print(snp)
         wt.write(snp)
         logger.info("completed processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
-            self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
+            self.chrm, self.start, self.end, self.ref, self.alt))
         return snp
 
 
@@ -294,6 +346,9 @@ if __name__ == '__main__':
     parser.add_argument('barcodes', help='list of good barcodes file')
     parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
     parser.add_argument('-f', "--filter", type=int, default=0,
+                        help='number of reads required per barcode default: 0')
+    parser.add_argument('-vcf', default = False, action='store_true', dest = 'nf4_mode',
+                        help="Standard vcf file v4.2")
                         help='number of reads required per barcode default: 0')
     parser.add_argument('-mq', "--mapq", type=int, default=0,
                         help='Skip read with mapq smaller than default : 0')
@@ -309,6 +364,7 @@ if __name__ == '__main__':
     counts = args.filter
     bq = args.baseq
     mq = args.mapq
+    vcf_file = args.vcf
     logger.basicConfig(filename=outfile + '.log', filemode='w+',
                        level=logger.DEBUG,
                        format='%(asctime)s %(levelname)s %(message)s')
@@ -319,17 +375,31 @@ if __name__ == '__main__':
     num_lines_barcode = sum(1 for lines in open(barcodes_good))
     logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
     bars = GenomicPosition.good_barcodes(barcodes_good)
-    with open(outfile + '_AllCounts.tsv', 'w+') as var, \
+    if vcf_file:
+        regions = pysam.VariantFilen(variants)
+        with open(outfile + '_AllCounts.tsv', 'w+') as var, \
+            open(outfile + '_counts_CB.tsv', 'w+') as CB, \
+            open(outfile + '_counts_UB.tsv', 'w+') as UB:
+    else:
+        with open(outfile + '_AllCounts.tsv', 'w+') as var, \
             open(outfile + '_counts_CB.tsv', 'w+') as CB, \
             open(outfile + '_counts_UB.tsv', 'w+') as UB, \
             open(variants, 'r') as regions:
         # write headers
-        var_header = ['chr', 'start', 'end', 'ref', 'alt', 'gene', 'type',
+        if vcf_file:
+            var_header = ['chr', 'start', 'end', 'ref', 'alt',
+                      'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
+        else:
+            var_header = ['chr', 'start', 'end', 'ref', 'alt', 'gene', 'type',
                       'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
         var_h = '\t'.join(var_header) + '\n'
         var.write(var_h)
 
-        CB_header = ['chrm', 'start', 'end', 'ref', 'alt',
+        if vcf_file:
+            CB_header = ['chrm', 'start', 'end', 'ref', 'alt',
+                     'barcode', 'ref_count', 'alt_count', 'total_CB']
+        else:
+            CB_header = ['chrm', 'start', 'end', 'ref', 'alt',
                      'type', 'gene', 'barcode', 'ref_count', 'alt_count', 'total_CB']
         CB_h = '\t'.join(CB_header) + '\n'
         CB.write(CB_h)
@@ -340,13 +410,21 @@ if __name__ == '__main__':
         UB.write(UB_h)
 
         next(regions)
-        for lines in regions:
-            x = GenomicPosition(lines)
-
-            print(x.chrm, x.start, x.event, x.gene, x.classify())
-            barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
+        if vcf_file:
+            for lines in regions:
+                x = GenomicPosition(lines)
+                print(x.chrm, x.start, x.event, x.gene, x.classify())
+                barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
             # print(check_classify[0])
-            counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
+                counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
+
+        else:
+            for lines in regions:
+                x = GenomicPosition(lines)
+                print(x.chrm, x.start, x.event, x.gene, x.classify())
+                barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
+                # print(check_classify[0])
+                counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
 
 logger.info("end process")
 
