@@ -40,10 +40,13 @@ class GenomicPosition:
 		v = ['A', 'T', 'G', 'C']
 		if self.ref and self.alt in v:
 			return 0
+
 		else:
 			if self.alt == '-':  # deletion
 				return len(self.ref)
 			elif self.ref == '-':  # insertion
+				return len(self.alt)
+			elif len(self.ref) == len(self.alt) > 1:
 				return len(self.alt)
 
 	@classmethod
@@ -116,8 +119,8 @@ class GenomicPosition:
 						# barcode without mutations
 						if indel > 0 and self.alt == '-':
 							
-							print('{}:{}:{}:{}:{}:{}'.format(read.indel, read.alignment.get_tag('CB'),read.alignment.cigarstring,
-								read.query_position,self.alt,pileupcolumn.pos))
+							# print('{}:{}:{}:{}:{}:{}'.format(read.indel, read.alignment.get_tag('CB'),read.alignment.cigarstring,
+							# 	read.query_position,self.alt,pileupcolumn.pos))
 							q_name = read.alignment.query_name
 							q_tag = read.alignment.get_tag('CB')
 							qU_tag = read.alignment.get_tag('UB')
