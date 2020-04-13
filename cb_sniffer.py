@@ -117,7 +117,7 @@ class GenomicPosition:
 						barUcodes['{}'.format(q_name)].append(qstring)
 
 						# barcode without mutations
-						if indel > 0 and self.alt == '-':
+						if indel > 0:
 							
 							# print('{}:{}:{}:{}:{}:{}'.format(read.indel, read.alignment.get_tag('CB'),read.alignment.cigarstring,
 							# 	read.query_position,self.alt,pileupcolumn.pos))
@@ -167,7 +167,7 @@ class GenomicPosition:
 									# print(ustring)
 									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
 						else:
-							
+							#print(indel,read.query_position,read.alignment.query_sequence[read.query_position])
 							if read.alignment.query_sequence[read.query_position] != self.alt:
 								ref_tag = read.alignment.get_tag('CB')
 								# UB
