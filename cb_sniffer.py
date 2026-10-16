@@ -83,7 +83,8 @@ class GenomicPosition:
 				self.chrm,self.start, self.end, self.ref, self.alt, self.gene, self.event))
 
 			for pileupcolumn in pile.pileup(reference=self.chrm, start=self.start - 1, end=self.start,
-											truncate=True, stepper="nofilter", max_depth=100000000):
+											truncate=True, stepper="nofilter", max_depth=100000000,
+											min_base_quality=0):
 				for read in pileupcolumn.pileups:
 
 					if read.alignment.has_tag('CB') and read.alignment.has_tag('UB'):
