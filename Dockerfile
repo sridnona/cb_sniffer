@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 python:3.11-slim
+FROM python:3.11-slim
 
 # procps provides `ps`, which some HPC/LSF docker wrappers expect
 RUN apt-get update \

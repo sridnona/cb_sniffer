@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict
 import gzip
+import itertools
 import pysam
 import logging as logger
 import sys
@@ -472,18 +473,39 @@ def is_vcf(path):
 	return head.startswith(b'##fileformat=VCF') or head.startswith(b'BCF')
 
 
+def is_tsv_header(line):
+	"""
+	:param line: first line of a tsv variant file
+	:return: True if it's a header: it starts with '#', or its start column isn't an integer
+	"""
+	fields = line.rstrip('\r\n').split('\t')
+	if line.startswith('#'):
+		return True
+	if len(fields) < 2:  # blank or not tab-separated: let the parser report it
+		return False
+	try:
+		int(fields[1])
+	except ValueError:
+		return True
+	return False
+
+
 def read_variants(path, pass_only=False):
 	"""
-	:param path: tsv variant file with header, or VCF/BCF
+	:param path: tsv variant file (header line optional), or VCF/BCF
 	:param pass_only: VCF only, skip records whose FILTER isn't PASS or '.'
 	:return: generator of GenomicPosition, one per ALT allele for VCF records
 	gene is taken from the VCF ID column and type is the variant kind
 	"""
 	if not is_vcf(path):
 		with open(path, 'r') as regions:
-			if next(regions, None) is None:  # header
+			first = next(regions, None)
+			if first is None:
 				die("{}: variant file is empty".format(path))
-			for line_num, lines in enumerate(regions, start=2):
+			start = 2
+			if not is_tsv_header(first):
+				regions, start = itertools.chain([first], regions), 1
+			for line_num, lines in enumerate(regions, start=start):
 				try:
 					x = GenomicPosition(lines)
 				except ValueError as e:
@@ -515,7 +537,7 @@ def read_variants(path, pass_only=False):
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
 	parser.add_argument('bam_file', help='BAM or CRAM file (CRAM requires -r)')
-	parser.add_argument('variant_file', help='variants: tsv file with header, or VCF/BCF (optionally gzipped)')
+	parser.add_argument('variant_file', help='variants: tsv file (header line optional), or VCF/BCF (optionally gzipped)')
 	parser.add_argument('barcodes', help='list of good barcodes file')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
 	parser.add_argument('-f', "--filter", type=int, default=0,

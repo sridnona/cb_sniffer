@@ -16,8 +16,8 @@ Parse CB barcodes from Single cell rna seq data
 
 positional arguments:
   bam_file              BAM or CRAM file (CRAM requires -r)
-  variant_file          variants: tsv file with header, or VCF/BCF (optionally
-                        gzipped)
+  variant_file          variants: tsv file (header line optional), or VCF/BCF
+                        (optionally gzipped)
   barcodes              list of good barcodes file
   upn                   upn/sample name: will be used as prefix for out_file
 
@@ -41,7 +41,7 @@ options:
 An indexed BAM or CRAM from Cell Ranger, with `CB` and `UB` tags. A CRAM needs `-r`, and the run stops with an error without it. The FASTA must be the reference the CRAM was compressed against, and it's also used for indel left-alignment.
 
 #### Variant file
-Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-separated file with a header line. The format is detected from the file contents.
+Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-separated file. The format is detected from the file contents.
 
 ##### VCF
 - Each ALT allele of a multi-allelic record is counted separately, as its own output row.
@@ -55,6 +55,8 @@ Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-sep
 chrm	start	stop	ref	var	gene_name	trv_type
 19	4xxx	4xxx	G	A	gene_name	silent/misense/frame_shift  
 ```
+
+The header line is optional. The first line is treated as a header if it starts with `#` or its `start` column isn't an integer; otherwise it's read as a variant.
 
 Accepted `ref`/`var` notations (`start` is 1-based; `stop` isn't used):
 

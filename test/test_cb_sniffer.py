@@ -563,6 +563,36 @@ def test_empty_variant_file_dies(tmp_path):
 	assert 'variant file is empty' in run_expecting_error(tmp_path, '')
 
 
+@pytest.mark.parametrize('header', ['', '#chrm\tstart\tstop\tref\tvar\tgene\ttype\n'],
+						 ids=['no_header', 'hash_header'])
+def test_tsv_header_optional(tmp_path, default_run, header):
+	lines = open(VARIANTS).read().splitlines(True)[1:]
+	variants = tmp_path / 'variants.tsv'
+	variants.write_text(header + ''.join(lines))
+	result = run(tmp_path, variants=str(variants))
+	assert [normalized(r) for r in result['AllCounts']] == [normalized(r) for r in default_run['AllCounts']]
+
+
+def test_is_tsv_header():
+	from cb_sniffer import is_tsv_header
+	assert is_tsv_header(open(VARIANTS).readline())
+	assert is_tsv_header('#1\t100\t100\tA\tC\tg\tt\n')
+	assert not is_tsv_header('1\t100\t100\tA\tC\tg\tt\n')
+	assert not is_tsv_header('\n')  # blank first line is still an error, not a header
+
+
+def test_headerless_malformed_line_numbers(tmp_path):
+	"""without a header, line numbers count from the first line"""
+	lines = open(VARIANTS).read().splitlines()[1:]
+	lines[2] = lines[2].replace('\t', ' ')
+	err = run_expecting_error(tmp_path, '\n'.join(lines) + '\n')
+	assert 'line 3: expected at least 7 tab-separated columns' in err
+
+
+def test_blank_first_line_dies(tmp_path):
+	assert 'line 1: blank line' in run_expecting_error(tmp_path, '\n' + open(VARIANTS).read())
+
+
 # --- CRAM input ----------------------------------------------------------------
 
 # keep htslib from finding the reference anywhere but -r (no cache, no EBI download)
