@@ -291,6 +291,69 @@ def test_insertion_ignores_baseq(tmp_path, default_run):
 	assert read_counts(high, INS) == read_counts(default_run['counts_UB'], INS)
 
 
+def run_synthetic(tmp_path, reads, variant_line):
+	"""
+	Write reads to a BAM (each its own cell and UMI, all starting at 1-based
+	position 81 on contig 1), run cb_sniffer on one variant and return its
+	AllCounts row. reads: list of (cigar, sequence or None for all A's).
+	"""
+	import pysam
+	bam = str(tmp_path / 'synthetic.bam')
+	header = {'HD': {'VN': '1.6', 'SO': 'coordinate'}, 'SQ': [{'SN': '1', 'LN': 1000}]}
+	with pysam.AlignmentFile(bam, 'wb', header=header) as out:
+		for i, (cigar, seq) in enumerate(reads):
+			a = pysam.AlignedSegment()
+			a.query_name, a.cigarstring = 'read{}'.format(i), cigar
+			a.query_sequence = seq or 'A' * a.infer_query_length()
+			a.reference_id, a.reference_start, a.mapping_quality = 0, 80, 255
+			a.query_qualities = pysam.qualitystring_to_array('F' * len(a.query_sequence))
+			a.set_tags([('CB', 'CELL{}-1'.format(i)), ('UB', 'UMI{}'.format(i))])
+			out.write(a)
+	pysam.index(bam)
+	(tmp_path / 'bc.tsv').write_text(''.join('CELL{}-1\n'.format(i) for i in range(len(reads))))
+	(tmp_path / 'v.tsv').write_text('chrm\tstart\tstop\tref\tvar\tgene\ttype\n' + variant_line + '\n')
+	subprocess.run([sys.executable, SCRIPT, bam, 'v.tsv', 'bc.tsv', 'out'],
+				   cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL)
+	return read_tsv(str(tmp_path / 'out_AllCounts.tsv'))[0]
+
+
+def test_insertion_in_soft_clipped_read(tmp_path):
+	"""issues.md #4: the inserted bases must be read from the full read sequence"""
+	row = run_synthetic(tmp_path, [
+		('20M2I20M', 'A' * 20 + 'GT' + 'A' * 20),               # alt
+		('5S20M2I20M', 'CCCCC' + 'A' * 20 + 'GT' + 'A' * 20),   # alt, soft-clipped
+		('5S40M', 'CCCCC' + 'A' * 40),                          # ref, soft-clipped
+	], '1\t100\t100\t-\tGT\tg\tinsertion')
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('3', '2')
+	assert sorted(row['CB_barcodes'].split(',')) == ['CELL0-1', 'CELL1-1']
+
+
+@pytest.mark.parametrize('variant_line', [
+	'1\t100\t100\tA\t-\tg\tdeletion',     # dash style: start = deleted base
+	'1\t99\t100\tAA\tA\tg\tdeletion',     # VCF style: start = anchor base
+])
+def test_deletion_must_match(tmp_path, variant_line):
+	"""issues.md #5: only a deletion with the variant's start and length is alt"""
+	row = run_synthetic(tmp_path, [
+		('19M1D20M', None),   # 1-bp deletion of base 100: alt
+		('19M2D20M', None),   # 2-bp deletion starting at 100: skipped
+		('18M2D20M', None),   # deletion starting at 99, covers 100: skipped
+		('40M', None),        # no deletion: ref
+		('20M1D20M', None),   # deletion at 101, base 100 present: ref
+	], variant_line)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('3', '1')
+	assert row['CB_barcodes'] == 'CELL0-1'
+
+
+@pytest.mark.parametrize('cigar,expected', [
+	('19M1D20M', 1), ('19M2D20M', 2), ('18M2D20M', None), ('40M', None),
+	('20M1D20M', None), ('5S19M1D20M', 1), ('10M5N4M1D20M', 1),
+])
+def test_deletion_length(cigar, expected):
+	read = make_read(cigar, start=81)
+	assert variant('A', '-').deletion_length(read) == expected
+
+
 def test_vcf_style_matches_dash(tmp_path, default_run):
 	vcf = by_site(run(tmp_path, variants=VARIANTS_VCF)['AllCounts'])
 	dash = by_site(default_run['AllCounts'])

@@ -84,6 +84,22 @@ class GenomicPosition:
 		"""
 		return self.kind
 
+	def deletion_length(self, read):
+		"""
+		:return: length of the read's deletion that starts at the variant's
+		first deleted base, or None if it has no deletion starting there
+		"""
+		target = self.pos - 1  # 0-based
+		ref_pos = read.alignment.reference_start
+		for op, n in read.alignment.cigartuples:
+			if op == 2 and ref_pos == target:  # D
+				return n
+			if op in (0, 2, 3, 7, 8):  # M D N = X consume the reference
+				ref_pos += n
+			if ref_pos > target:
+				return None
+		return None
+
 	def read_allele(self, read, baseq):
 		"""
 		bases a read carries across a snp/mnp
@@ -159,6 +175,9 @@ class GenomicPosition:
 							if read.is_refskip or \
 							int(read.alignment.mapping_quality) < int(mapq):
 								continue
+							# a different deletion over this position is neither ref nor alt
+							if self.kind == 'del' and read.is_del and self.deletion_length(read) != indel:
+								continue
 						else:
 
 							if read.is_del or read.is_refskip or \
@@ -208,7 +227,7 @@ class GenomicPosition:
 									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
 							else:
 								if read.alignment.has_tag('CB') and read.indel == indel and \
-									read.alignment.query_alignment_sequence[read.query_position +
+									read.alignment.query_sequence[read.query_position +
 										1:read.query_position + read.indel + 1] == self.var_alt:
 									# print('indel length', read.indel)
 									alt_tag = read.alignment.get_tag('CB')
