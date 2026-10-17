@@ -187,12 +187,22 @@ def test_consensus_no_reads():
 
 def test_output_headers(default_run):
 	assert list(default_run['AllCounts'][0].keys()) == [
-		'chr', 'start', 'end', 'ref', 'alt', 'gene', 'type',
+		'chr', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 		'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
 	for name, total in (('counts_CB', 'total_CB'), ('counts_UB', 'total_UB')):
 		assert list(default_run[name][0].keys()) == [
 			'chrm', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 			'barcode', 'ref_count', 'alt_count', total]
+
+
+def test_type_and_gene_columns(default_run, vcf_run):
+	row = by_site(default_run['AllCounts'])[DEL]
+	assert (row['type'], row['gene']) == ('deletion', 'Slco5a1')
+	row = [r for r in vcf_run if int(r['start']) == 12904212][0]
+	assert (row['type'], row['gene']) == ('del', 'Slco5a1')
+	for name in ('counts_CB', 'counts_UB'):
+		row = [r for r in default_run[name] if int(r['start']) == DEL][0]
+		assert (row['type'], row['gene']) == ('deletion', 'Slco5a1')
 
 
 def test_one_summary_row_per_variant(default_run):

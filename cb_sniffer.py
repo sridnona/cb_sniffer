@@ -480,7 +480,7 @@ if __name__ == '__main__':
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
 			open(outfile + '_counts_UB.tsv', 'w+') as UB:
 		# write headers
-		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'gene', 'type',
+		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 					  'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
 		var_h = '\t'.join(var_header) + '\n'
 		var.write(var_h)
