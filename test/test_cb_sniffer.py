@@ -345,6 +345,33 @@ def test_deletion_must_match(tmp_path, variant_line):
 	assert row['CB_barcodes'] == 'CELL0-1'
 
 
+def base_at_100(bases):
+	"""40-base read starting at 81 with the given bases from position 100"""
+	return ('40M', 'A' * 19 + bases + 'A' * (21 - len(bases)))
+
+
+def test_snp_other_alleles_skipped(tmp_path):
+	"""issues.md #6: a read with neither the ref nor the alt base is not ref"""
+	row = run_synthetic(tmp_path, [
+		base_at_100('A'),   # ref
+		base_at_100('C'),   # alt
+		base_at_100('G'),   # third allele: skipped
+		base_at_100('N'),   # N: skipped
+	], '1\t100\t100\tA\tC\tg\tsnp')
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('2', '1', '0.5')
+
+
+def test_mnp_partial_alleles_skipped(tmp_path):
+	"""issues.md #6: a read with only some of the mnp's alt bases is not ref"""
+	row = run_synthetic(tmp_path, [
+		base_at_100('AA'),  # ref
+		base_at_100('CG'),  # alt
+		base_at_100('CA'),  # first alt base only: skipped
+		base_at_100('AG'),  # second alt base only: skipped
+	], '1\t100\t101\tAA\tCG\tg\tmnp')
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('2', '1', '0.5')
+
+
 @pytest.mark.parametrize('cigar,expected', [
 	('19M1D20M', 1), ('19M2D20M', 2), ('18M2D20M', None), ('40M', None),
 	('20M1D20M', None), ('5S19M1D20M', 1), ('10M5N4M1D20M', 1),
@@ -444,8 +471,9 @@ def test_vcf_matches_tsv(vcf_run, default_run):
 	assert set(vcf) == set(VCF_FILE_SITES) | {(13625741, 'G')}
 	for key, site in VCF_FILE_SITES.items():
 		assert [vcf[key][c] for c in COUNT_COLS] == [tsv[site][c] for c in COUNT_COLS], key
-	# second ALT allele at the SNV: no reads carry G
-	assert (vcf[(13625741, 'G')]['UB_DEPTH'], vcf[(13625741, 'G')]['UB_ALT']) == ('28', '0')
+	# second ALT allele at the SNV: no reads carry G, and reads carrying C
+	# are neither ref nor alt for it, so only the 14 ref UMIs are counted
+	assert (vcf[(13625741, 'G')]['UB_DEPTH'], vcf[(13625741, 'G')]['UB_ALT']) == ('14', '0')
 
 
 @pytest.mark.parametrize('fmt', ['vcf.gz', 'bcf'])

@@ -184,7 +184,8 @@ class GenomicPosition:
 							int(read.alignment.mapping_quality) < int(mapq):
 								continue
 							allele = self.read_allele(read, baseq)
-							if allele is None:
+							# reads with a third allele (or N, or part of an mnp) are neither ref nor alt
+							if allele not in (self.var_ref, self.var_alt):
 								continue
 
 						q_name = read.alignment.query_name
@@ -246,7 +247,7 @@ class GenomicPosition:
 									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
 						else:
 							#print(indel,read.query_position,read.alignment.query_sequence[read.query_position])
-							if allele != self.var_alt:
+							if allele == self.var_ref:
 								ref_tag = read.alignment.get_tag('CB')
 								# UB
 								refU_tag = read.alignment.get_tag('UB')
