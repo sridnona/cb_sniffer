@@ -139,9 +139,22 @@ def test_read_allele_snp():
 	assert variant('T', 'C').read_allele(make_read('14M', 'FFFFF!FFFFFFFF'), 20) is None
 
 
-def test_too_few_columns_exits():
-	with pytest.raises(SystemExit):
-		GenomicPosition('1\t100\t100\tA\tT\n')
+@pytest.mark.parametrize('line,message', [
+	('\n', 'blank line'),
+	('  \t \n', 'blank line'),
+	('1\t100\t100\tA\tT\n', 'expected at least 7 tab-separated columns, found 5'),
+	('1 100 100 A T g snp\n', 'expected at least 7 tab-separated columns, found 1'),
+	('1\t1e2\t100\tA\tT\tg\tsnp\n', 'start and stop must be integers'),
+])
+def test_malformed_line_raises(line, message):
+	with pytest.raises(ValueError, match=message):
+		GenomicPosition(line)
+
+
+def test_extra_columns_and_crlf_allowed():
+	v = GenomicPosition('1\t100\t100\tA\tT\tg\tsnp\textra\r\n')
+	assert (v.start, v.ref, v.alt, v.event) == (100, 'A', 'T', 'snp')
+	assert GenomicPosition('1\t100\t100\tA\tT\tg\t\n').event == ''  # empty last column
 
 
 def test_good_barcodes(tmp_path):
@@ -403,13 +416,35 @@ def test_complex_variant_is_skipped(tmp_path):
 	assert [int(r['start']) for r in rows] == [DEL, INS, SNV, SNV_MQ, NOCOV, MNP]
 
 
-@pytest.mark.xfail(strict=True, reason='issues.md #7: a blank line in the variant file aborts the run')
-def test_trailing_blank_line(tmp_path):
+def run_expecting_error(tmp_path, text):
 	variants = tmp_path / 'variants.tsv'
-	shutil.copy(VARIANTS, str(variants))
-	with open(str(variants), 'a') as f:
-		f.write('\n')
-	assert len(run(tmp_path, variants=str(variants))['AllCounts']) == 6
+	variants.write_text(text)
+	cmd = [sys.executable, SCRIPT, BAM, str(variants), BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+	assert result.returncode == 1
+	assert not list(tmp_path.glob('out_*.tsv'))  # fails before writing any output
+	assert result.stderr.startswith('ERROR: ')
+	assert result.stderr.strip()[len('ERROR: '):] in (tmp_path / 'out.log').read_text()
+	return result.stderr
+
+
+def test_trailing_blank_line_dies(tmp_path):
+	"""issues.md #7"""
+	err = run_expecting_error(tmp_path, open(VARIANTS).read() + '\n')
+	assert 'line 8: blank line' in err
+
+
+def test_malformed_line_dies(tmp_path):
+	lines = open(VARIANTS).read().splitlines()
+	lines[3] = lines[3].replace('\t', ' ')
+	err = run_expecting_error(tmp_path, '\n'.join(lines) + '\n')
+	assert 'line 4: expected at least 7 tab-separated columns, found 1' in err
+	assert repr(lines[3]) in err
+
+
+def test_empty_variant_file_dies(tmp_path):
+	assert 'variant file is empty' in run_expecting_error(tmp_path, '')
+
 
 
 # --- VCF input -----------------------------------------------------------------

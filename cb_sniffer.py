@@ -17,14 +17,20 @@ class GenomicPosition:
 		:param line:
 		 for each variant holds genomics positions
 		 and other informations
+		:raises ValueError: if the line has fewer than 7 tab-separated
+		 columns or start/stop aren't integers
 		"""
-		region = line.strip().split('\t')
+		if not line.strip():
+			raise ValueError("blank line")
+		region = line.rstrip('\r\n').split('\t')
 		if len(region) < 7:
-			logger.debug("Insufficient columns fields please check variant file")
-			sys.exit(1)
+			raise ValueError("expected at least 7 tab-separated columns, found {}".format(len(region)))
 		self.chrm = region[0]
-		self.start = int(region[1])
-		self.end = int(region[2])
+		try:
+			self.start = int(region[1])
+			self.end = int(region[2])
+		except ValueError:
+			raise ValueError("start and stop must be integers")
 		self.ref = region[3]
 		self.alt = region[4]
 		self.gene = region[5]  # gene name
@@ -415,6 +421,12 @@ def warn(msg):
 	print('WARNING: ' + msg, file=sys.stderr)
 
 
+def die(msg):
+	logger.error(msg)
+	print('ERROR: ' + msg, file=sys.stderr)
+	sys.exit(1)
+
+
 def is_vcf(path):
 	"""
 	:param path: variant file
@@ -436,9 +448,14 @@ def read_variants(path, pass_only=False):
 	"""
 	if not is_vcf(path):
 		with open(path, 'r') as regions:
-			next(regions)  # header
-			for lines in regions:
-				yield GenomicPosition(lines)
+			if next(regions, None) is None:  # header
+				die("{}: variant file is empty".format(path))
+			for line_num, lines in enumerate(regions, start=2):
+				try:
+					x = GenomicPosition(lines)
+				except ValueError as e:
+					die("{}: line {}: {}: {!r}".format(path, line_num, e, lines.rstrip('\r\n')))
+				yield x
 		return
 	verbosity = pysam.set_verbosity(0)  # no htslib error about a missing index
 	try:
