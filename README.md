@@ -18,7 +18,7 @@ positional arguments:
   bam_file              BAM or CRAM file (CRAM requires -r)
   variant_file          variants: tsv file (header line optional), or VCF/BCF
                         (optionally gzipped)
-  barcodes              list of good barcodes file
+  barcodes              list of good barcodes file (may be gzipped)
   upn                   upn/sample name: will be used as prefix for out_file
 
 options:
@@ -80,6 +80,7 @@ SNPs and multi-base substitutions don't use the reference.
 With `-r`, the deleted bases of each deletion are also checked against the reference, and a warning is printed if they don't match.
 
 #### barcodes
+One barcode per line, plain or gzipped (e.g. Cell Ranger's `barcodes.tsv.gz`), detected from the file contents.
 ```{shell}
 AACCTGAGAATGTTG-1
 AAACCTGAGCTACCGC-1

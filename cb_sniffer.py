@@ -115,14 +115,15 @@ class GenomicPosition:
 	def good_barcodes(cls,f):
 		"""
 
-		:param f: good barcodes file
+		:param f: good barcodes file, one per line, plain or gzipped
 		:return: dict with good barcodes
 		"""
 		barc = {}
-		with open(f, 'r') as barcodes:
+		with open_text(f) as barcodes:
 			for line in barcodes:
 				lines = line.strip()
-				barc[lines] = 1
+				if lines:
+					barc[lines] = 1
 		return barc
 
 	def count_barcodes(self, pile, bar, mapq=0, baseq=0, fasta=None):
@@ -461,14 +462,22 @@ def is_cram(path):
 		return f.read(4) == b'CRAM'
 
 
+def is_gzipped(path):
+	with open(path, 'rb') as f:
+		return f.read(2) == b'\x1f\x8b'
+
+
+def open_text(path):
+	"""open a plain or gzipped (judged by content) text file for reading"""
+	return gzip.open(path, 'rt') if is_gzipped(path) else open(path, 'r')
+
+
 def is_vcf(path):
 	"""
 	:param path: variant file
 	:return: True for VCF (plain, gzip or bgzip) or BCF, judged by content
 	"""
-	with open(path, 'rb') as f:
-		compressed = f.read(2) == b'\x1f\x8b'
-	with (gzip.open(path, 'rb') if compressed else open(path, 'rb')) as f:
+	with (gzip.open(path, 'rb') if is_gzipped(path) else open(path, 'rb')) as f:
 		head = f.read(16)
 	return head.startswith(b'##fileformat=VCF') or head.startswith(b'BCF')
 
@@ -538,7 +547,7 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
 	parser.add_argument('bam_file', help='BAM or CRAM file (CRAM requires -r)')
 	parser.add_argument('variant_file', help='variants: tsv file (header line optional), or VCF/BCF (optionally gzipped)')
-	parser.add_argument('barcodes', help='list of good barcodes file')
+	parser.add_argument('barcodes', help='list of good barcodes file (may be gzipped)')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
 	parser.add_argument('-f', "--filter", type=int, default=0,
 						help='number of reads required per barcode default: 0')
@@ -582,9 +591,8 @@ if __name__ == '__main__':
 		warn("no --reference given: indels are only counted at the exact position given, "
 			 "not elsewhere in a repeat")
 
-	num_lines_barcode = sum(1 for lines in open(barcodes_good))
-	logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
 	bars = GenomicPosition.good_barcodes(barcodes_good)
+	logger.info("Number of good barcodes:\t{}".format(len(bars)))
 	with open(outfile + '_AllCounts.tsv', 'w+') as var, \
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
 			open(outfile + '_counts_UB.tsv', 'w+') as UB, \

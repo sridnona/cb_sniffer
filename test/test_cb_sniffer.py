@@ -593,6 +593,17 @@ def test_blank_first_line_dies(tmp_path):
 	assert 'line 1: blank line' in run_expecting_error(tmp_path, '\n' + open(VARIANTS).read())
 
 
+def test_gzipped_barcodes(tmp_path, default_run):
+	import gzip
+	gz = str(tmp_path / 'barcodes.tsv.gz')
+	with open(BARCODES, 'rb') as f, gzip.open(gz, 'wb') as out:
+		out.write(f.read())
+	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, gz, 'out']
+	subprocess.run(cmd, cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL)
+	rows = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))
+	assert [normalized(r) for r in rows] == [normalized(r) for r in default_run['AllCounts']]
+
+
 # --- CRAM input ----------------------------------------------------------------
 
 # keep htslib from finding the reference anywhere but -r (no cache, no EBI download)
