@@ -1,4 +1,5 @@
 from collections import defaultdict
+import gzip
 import pysam
 import logging as logger
 import sys
@@ -29,25 +30,79 @@ class GenomicPosition:
 		self.gene = region[5]  # gene name
 		self.event = region[6]  #
 		# print(self, self.chrm, self.start, self.ref, self.alt,self.event)
+		self.normalize()
+
+	def normalize(self):
+		"""
+		converts the variant to a minimal representation used for counting reads
+		(the original start/ref/alt are kept for the output files)
+
+		accepted inputs:
+		  SNP / multi-base  T/C, ATC/GGC   start = first base
+		  dash indels       C/-            start = first deleted base
+		                    -/A            start = base before the insertion
+		  VCF-style indels  ACT/A, A/AC    start = anchor base (VCF POS)
+
+		sets:
+		  self.kind     'snp', 'mnp', 'ins', 'del' or 'complex'
+		  self.pos      1-based position to pile up on
+		  self.var_ref  ref bases without padding ('' for an insertion)
+		  self.var_alt  alt bases without padding ('' for a deletion)
+		"""
+		ref = '' if self.ref == '-' else self.ref.upper()
+		alt = '' if self.alt == '-' else self.alt.upper()
+		pos = self.start
+		vcf_style = '-' not in (self.ref, self.alt)
+		if vcf_style:
+			# a VCF indel happens right after its anchor base, so drop the anchor
+			# first; then trim shared trailing and leading bases. This keeps the
+			# caller's position (A/AA stays after the anchor) while extra padding
+			# across a repeat (ACCCC/ACCC) is trimmed back to the first base
+			if len(ref) != len(alt) and ref[:1] == alt[:1]:
+				ref, alt = ref[1:], alt[1:]
+				pos += 1
+			while ref and alt and ref[-1] == alt[-1]:
+				ref, alt = ref[:-1], alt[:-1]
+			while ref and alt and ref[0] == alt[0]:
+				ref, alt = ref[1:], alt[1:]
+				pos += 1
+		if ref and not alt:
+			kind = 'del'
+		elif alt and not ref:
+			kind = 'ins'
+			if vcf_style:
+				pos -= 1  # pile up on the base before the inserted bases
+		elif ref and len(ref) == len(alt):
+			kind = 'snp' if len(ref) == 1 else 'mnp'
+		else:
+			kind = 'complex'  # unequal-length substitution, or ref == alt
+		self.kind, self.pos, self.var_ref, self.var_alt = kind, pos, ref, alt
 
 	def classify(self):
 		"""
-		for each variant classifies if its a snp or variant
-		:return:
-		0 for snp
-		int if its insertion or deletion
+		:return: 'snp', 'mnp', 'ins', 'del' or 'complex'
 		"""
-		v = ['A', 'T', 'G', 'C']
-		if self.ref and self.alt in v:
-			return 0
+		return self.kind
 
-		else:
-			if self.alt == '-':  # deletion
-				return len(self.ref)
-			elif self.ref == '-':  # insertion
-				return len(self.alt)
-			elif len(self.ref) == len(self.alt) > 1:
-				return len(self.alt)
+	def read_allele(self, read, baseq):
+		"""
+		bases a read carries across a snp/mnp
+		:return: base string, or None if the read doesn't cover every base
+		without a gap or any base is below baseq
+		"""
+		n = len(self.var_alt)
+		qpos = read.query_position
+		if n > 1:
+			aligned = dict((r, q) for q, r in read.alignment.get_aligned_pairs(matches_only=True))
+			if any(aligned.get(self.pos - 1 + i) != qpos + i for i in range(n)):
+				return None
+		if min(read.alignment.query_qualities[qpos:qpos + n]) < int(baseq):
+			return None
+		return read.alignment.query_sequence[qpos:qpos + n]
+
+	@classmethod
+	def from_fields(cls, chrm, start, end, ref, alt, gene, event):
+		return cls('\t'.join(str(f) for f in (chrm, start, end, ref, alt, gene, event)))
 
 	@classmethod
 	def good_barcodes(cls,f):
@@ -63,12 +118,11 @@ class GenomicPosition:
 				barc[lines] = 1
 		return barc
 
-	def count_barcodes(self, bam_fil, bar, indel, mapq=0, baseq=0):
+	def count_barcodes(self, bam_fil, bar, mapq=0, baseq=0):
 		"""
 
 		:param bam_fil: bam_file
 		:param bar: good barcodes dict
-		:param indel: SNP = 0 indel= int(window size) insertion or deletion
 		:param mapq: mapping quality
 		:param baseq: base quality
 		:return: two dicts 1) list of all barcodes at given var pos
@@ -78,11 +132,13 @@ class GenomicPosition:
 		# ======================================
 		barUcodes = defaultdict(list)  # UB
 		bar_count = {'ref': [], 'alt': []}  # UB
+		# indel length, 0 for snp/mnp
+		indel = len(self.var_alt) if self.kind == 'ins' else len(self.var_ref) if self.kind == 'del' else 0
 		with pysam.AlignmentFile(bam_fil, 'rb') as pile:
 			logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
 				self.chrm,self.start, self.end, self.ref, self.alt, self.gene, self.event))
 
-			for pileupcolumn in pile.pileup(reference=self.chrm, start=self.start - 1, end=self.start,
+			for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
 											truncate=True, stepper="nofilter", max_depth=100000000,
 											min_base_quality=0):
 				for read in pileupcolumn.pileups:
@@ -106,8 +162,10 @@ class GenomicPosition:
 						else:
 
 							if read.is_del or read.is_refskip or \
-							int(read.alignment.query_qualities[read.query_position]) < int(baseq) or \
 							int(read.alignment.mapping_quality) < int(mapq):
+								continue
+							allele = self.read_allele(read, baseq)
+							if allele is None:
 								continue
 
 						q_name = read.alignment.query_name
@@ -128,7 +186,7 @@ class GenomicPosition:
 							qstring = q_tag + ':' + qU_tag
 							barcodes['{}'.format(q_name)].append(q_tag)
 							barUcodes['{}'.format(q_name)].append(qstring)
-							if self.alt == '-':
+							if self.kind == 'del':
 								if read.alignment.has_tag('CB') and read.query_position == None:
 								# and read.indel == indel and \
 								# 				read.alignment.query_alignment_sequence[read.query_position +
@@ -151,7 +209,7 @@ class GenomicPosition:
 							else:
 								if read.alignment.has_tag('CB') and read.indel == indel and \
 									read.alignment.query_alignment_sequence[read.query_position +
-										1:read.query_position + read.indel + 1] == self.alt:
+										1:read.query_position + read.indel + 1] == self.var_alt:
 									# print('indel length', read.indel)
 									alt_tag = read.alignment.get_tag('CB')
 									# UB
@@ -169,14 +227,14 @@ class GenomicPosition:
 									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
 						else:
 							#print(indel,read.query_position,read.alignment.query_sequence[read.query_position])
-							if read.alignment.query_sequence[read.query_position] != self.alt:
+							if allele != self.var_alt:
 								ref_tag = read.alignment.get_tag('CB')
 								# UB
 								refU_tag = read.alignment.get_tag('UB')
 								ustring = ref_tag + ':' + refU_tag
 								bar_count['ref'].append(ustring)
 								# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
-							elif read.alignment.query_sequence[read.query_position] == self.alt:
+							else:
 								# CB
 								alt_tag = read.alignment.get_tag('CB')
 								# UB
@@ -332,10 +390,62 @@ class GenomicPosition:
 		return snp
 
 
+def warn(msg):
+	logger.warning(msg)
+	print('WARNING: ' + msg, file=sys.stderr)
+
+
+def is_vcf(path):
+	"""
+	:param path: variant file
+	:return: True for VCF (plain, gzip or bgzip) or BCF, judged by content
+	"""
+	with open(path, 'rb') as f:
+		compressed = f.read(2) == b'\x1f\x8b'
+	with (gzip.open(path, 'rb') if compressed else open(path, 'rb')) as f:
+		head = f.read(16)
+	return head.startswith(b'##fileformat=VCF') or head.startswith(b'BCF')
+
+
+def read_variants(path, pass_only=False):
+	"""
+	:param path: tsv variant file with header, or VCF/BCF
+	:param pass_only: VCF only, skip records whose FILTER isn't PASS or '.'
+	:return: generator of GenomicPosition, one per ALT allele for VCF records
+	gene is taken from the VCF ID column and type is the variant kind
+	"""
+	if not is_vcf(path):
+		with open(path, 'r') as regions:
+			next(regions)  # header
+			for lines in regions:
+				yield GenomicPosition(lines)
+		return
+	verbosity = pysam.set_verbosity(0)  # no htslib error about a missing index
+	try:
+		vcf = pysam.VariantFile(path)
+	finally:
+		pysam.set_verbosity(verbosity)
+	with vcf:
+		for rec in vcf:
+			if pass_only and list(rec.filter.keys()) not in ([], ['PASS']):
+				logger.info("skipping filtered variant: {}\t{}\t{}\t{}".format(
+					rec.chrom, rec.pos, rec.ref, ','.join(rec.alts or ())))
+				continue
+			for alt in rec.alts or ():
+				if not alt or set(alt.upper()) - set('ACGTN'):
+					warn("skipping symbolic/breakend allele: {}\t{}\t{}\t{}".format(
+						rec.chrom, rec.pos, rec.ref, alt))
+					continue
+				x = GenomicPosition.from_fields(rec.chrom, rec.pos, rec.stop, rec.ref, alt,
+												rec.id or '.', '.')
+				x.event = x.kind
+				yield x
+
+
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
 	parser.add_argument('bam_file', help='BAM file')
-	parser.add_argument('variant_file', help='variants file with header')
+	parser.add_argument('variant_file', help='variants: tsv file with header, or VCF/BCF (optionally gzipped)')
 	parser.add_argument('barcodes', help='list of good barcodes file')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
 	parser.add_argument('-f', "--filter", type=int, default=0,
@@ -344,6 +454,8 @@ if __name__ == '__main__':
 						help='Skip read with mapq smaller than default : 0')
 	parser.add_argument('-bq', "--baseq", type=int, default=1,
 						help='Skip bases with base quality less than default : 1')
+	parser.add_argument("--pass-only", action='store_true',
+						help='VCF input: skip records whose FILTER is not PASS or .')
 
 	args = parser.parse_args()
 
@@ -358,16 +470,15 @@ if __name__ == '__main__':
 					   level=logger.DEBUG,
 					   format='%(asctime)s %(levelname)s %(message)s')
 	logger.info("Start process")
-	num_lines_variants = sum(1 for line in open(variants)) - 1  # minus header
-	logger.info("Number of variants:\t{}".format(num_lines_variants))
+	variant_list = list(read_variants(variants, args.pass_only))
+	logger.info("Number of variants:\t{}".format(len(variant_list)))
 
 	num_lines_barcode = sum(1 for lines in open(barcodes_good))
 	logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
 	bars = GenomicPosition.good_barcodes(barcodes_good)
 	with open(outfile + '_AllCounts.tsv', 'w+') as var, \
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
-			open(outfile + '_counts_UB.tsv', 'w+') as UB, \
-			open(variants, 'r') as regions:
+			open(outfile + '_counts_UB.tsv', 'w+') as UB:
 		# write headers
 		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'gene', 'type',
 					  'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
@@ -384,12 +495,13 @@ if __name__ == '__main__':
 		UB_h = '\t'.join(UB_header) + '\n'
 		UB.write(UB_h)
 
-		next(regions)
-		for lines in regions:
-			x = GenomicPosition(lines)
-
+		for x in variant_list:
 			print(x.chrm, x.start, x.event, x.gene, x.classify())
-			barcode_counts = x.count_barcodes(bam_file, bars, x.classify(), mq, bq)
+			if x.kind == 'complex':
+				warn("skipping unsupported variant (ref and alt differ in length "
+					 "after trimming shared bases): {}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
+				continue
+			barcode_counts = x.count_barcodes(bam_file, bars, mq, bq)
 			# print(check_classify[0])
 			counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
 

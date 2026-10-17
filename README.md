@@ -8,18 +8,19 @@ Usage
 ----
 ```{shell}
 python3 cb_sniffer.py -h
-usage: cb_sniffer.py [-h] [-f FILTER] [-mq MAPQ] [-bq BASEQ]
+usage: cb_sniffer.py [-h] [-f FILTER] [-mq MAPQ] [-bq BASEQ] [--pass-only]
                      bam_file variant_file barcodes upn
 
 Parse CB barcodes from Single cell rna seq data
 
 positional arguments:
   bam_file              BAM file
-  variant_file          variants file with header
+  variant_file          variants: tsv file with header, or VCF/BCF (optionally
+                        gzipped)
   barcodes              list of good barcodes file
   upn                   upn/sample name: will be used as prefix for out_file
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -f FILTER, --filter FILTER
                         number of reads required per barcode default: 0
@@ -27,13 +28,38 @@ optional arguments:
                         Skip read with mapq smaller than default : 0
   -bq BASEQ, --baseq BASEQ
                         Skip bases with base quality less than default : 1
+  --pass-only           VCF input: skip records whose FILTER is not PASS or .
 
 ```
-#### Variant file 
+#### Variant file
+Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-separated file with a header line. The format is detected from the file contents.
+
+##### VCF
+- Each ALT allele of a multi-allelic record is counted separately, as its own output row.
+- Symbolic (`<DEL>`), breakend and `*` alleles are skipped with a warning.
+- `--pass-only` skips records whose FILTER isn't `PASS` or `.`.
+- In the output, `gene` is the record's `ID` (`.` if missing), and `type` is the variant kind: `snp`, `mnp`, `ins` or `del`.
+- Sample columns are ignored.
+
+##### TSV
 ```{shell}
 chrm	start	stop	ref	var	gene_name	trv_type
 19	4xxx	4xxx	G	A	gene_name	silent/misense/frame_shift  
 ```
+
+Accepted `ref`/`var` notations (`start` is 1-based; `stop` isn't used):
+
+| Event | Example ref / var | `start` |
+|-------|-------------------|---------|
+| SNV | `G` / `A` | the base |
+| Multi-base substitution | `ATC` / `GGC` | first base |
+| Deletion, dash style | `CT` / `-` | first deleted base |
+| Insertion, dash style | `-` / `AC` | base before the insertion |
+| Deletion, VCF style | `ACT` / `A` | anchor base (VCF POS) |
+| Insertion, VCF style | `A` / `AAC` | anchor base (VCF POS) |
+
+Shared padding bases are trimmed, so `TG` / `CG` is counted as the SNV `T` / `C`. Substitutions whose ref and alt still differ in length after trimming (e.g. `ATC` / `GG`) aren't supported and are skipped with a warning.
+For multi-base substitutions, only reads covering every base without a gap are counted, and every base must pass `-bq`.
 
 #### barcodes
 ```{shell}
