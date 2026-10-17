@@ -206,12 +206,6 @@ class GenomicPosition:
 							
 							# print('{}:{}:{}:{}:{}:{}'.format(read.indel, read.alignment.get_tag('CB'),read.alignment.cigarstring,
 							# 	read.query_position,self.alt,pileupcolumn.pos))
-							q_name = read.alignment.query_name
-							q_tag = read.alignment.get_tag('CB')
-							qU_tag = read.alignment.get_tag('UB')
-							qstring = q_tag + ':' + qU_tag
-							barcodes['{}'.format(q_name)].append(q_tag)
-							barUcodes['{}'.format(q_name)].append(qstring)
 							if self.kind == 'del':
 								if read.alignment.has_tag('CB') and read.query_position == None:
 								# and read.indel == indel and \
