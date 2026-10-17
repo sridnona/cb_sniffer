@@ -1,0 +1,7 @@
+chrm	start	stop	ref	var	gene_name	trv_type
+1	12904213	12904213	C	-	Slco5a1	deletion
+1	13562395	13562395	-	A	Tram1	insertion
+1	13625741	13625741	T	C	Lactb2	snp
+1	15268954	15268954	T	C	Gm10566	snp_low_mapq
+1	10000001	10000001	T	G	none	no_coverage
+1	10066353	10066356	TATG	CATA	Cspp1	mnp
