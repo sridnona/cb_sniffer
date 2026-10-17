@@ -45,10 +45,10 @@ def read_tsv(path):
 		return list(csv.DictReader(f, delimiter='\t'))
 
 
-def run(tmp_path, *opts, variants=VARIANTS, prefix='out'):
+def run(tmp_path, *opts, variants=VARIANTS, prefix='out', bam=BAM, env=None):
 	"""Run cb_sniffer.py and return its three output tables, keyed by output name."""
-	cmd = [sys.executable, SCRIPT, *opts, BAM, variants, BARCODES, prefix]
-	subprocess.run(cmd, cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL)
+	cmd = [sys.executable, SCRIPT, *opts, bam, variants, BARCODES, prefix]
+	subprocess.run(cmd, cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL, env=env)
 	return {name: read_tsv(os.path.join(str(tmp_path), '{}_{}.tsv'.format(prefix, name)))
 			for name in ('AllCounts', 'counts_CB', 'counts_UB')}
 
@@ -562,6 +562,65 @@ def test_malformed_line_dies(tmp_path):
 def test_empty_variant_file_dies(tmp_path):
 	assert 'variant file is empty' in run_expecting_error(tmp_path, '')
 
+
+# --- CRAM input ----------------------------------------------------------------
+
+# keep htslib from finding the reference anywhere but -r (no cache, no EBI download)
+NO_REF_LOOKUP = dict(os.environ, REF_PATH='/nonexistent', REF_CACHE='/nonexistent')
+
+
+@pytest.fixture(scope='module')
+def cram(tmp_path_factory):
+	"""test.bam as an indexed CRAM whose reference is not embedded, and whose
+	header's UR: path no longer exists, so -r is the only way to decode it.
+	The header is cut down to match the test reference (only contig 1, truncated);
+	otherwise htslib embeds the reference in the CRAM."""
+	import pysam
+	d = tmp_path_factory.mktemp('cram')
+	ref, path = str(d / 'gone.fa.gz'), str(d / 'test.cram')
+	for ext in ('', '.fai', '.gzi'):
+		shutil.copy(REFERENCE + ext, ref + ext)
+	with pysam.FastaFile(REFERENCE) as fa:
+		sq = [{'SN': '1', 'LN': fa.get_reference_length('1')}]
+	with pysam.AlignmentFile(BAM) as src:
+		header = src.header.to_dict()
+		header['SQ'] = sq
+		header = pysam.AlignmentHeader.from_dict(header)
+		with pysam.AlignmentFile(path, 'wc', header=header, reference_filename=ref,
+								 format_options=[b'embed_ref=0']) as out:
+			for rec in src:
+				fields = rec.to_string().split('\t')
+				if fields[6] not in ('=', '*', '1'):  # mate on a contig not in the header
+					fields[6:8] = ['*', '0']
+				out.write(pysam.AlignedSegment.fromstring('\t'.join(fields), header))
+	pysam.index(path)
+	for ext in ('', '.fai', '.gzi'):
+		os.remove(ref + ext)
+	return path
+
+
+def test_cram_requires_reference(tmp_path, cram):
+	cmd = [sys.executable, SCRIPT, cram, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, env=NO_REF_LOOKUP)
+	assert result.returncode == 1
+	assert 'CRAM input requires a reference FASTA' in result.stderr
+	assert not list(tmp_path.glob('out_*.tsv'))
+
+
+def test_cram_matches_bam(tmp_path, cram):
+	from_bam = run(tmp_path, '-r', REFERENCE, prefix='bam')
+	from_cram = run(tmp_path, '-r', REFERENCE, prefix='cram', bam=cram, env=NO_REF_LOOKUP)
+	assert [normalized(r) for r in from_cram['AllCounts']] == [normalized(r) for r in from_bam['AllCounts']]
+	for name in ('counts_CB', 'counts_UB'):
+		key = lambda r: (r['start'], r['alt'], r['barcode'])
+		assert sorted(from_cram[name], key=key) == sorted(from_bam[name], key=key)
+
+
+def test_cram_no_multiple_iterators_warning(tmp_path, cram):
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, cram, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, env=NO_REF_LOOKUP)
+	assert result.returncode == 0
+	assert 'multiple_iterators' not in result.stderr
 
 
 # --- VCF input -----------------------------------------------------------------

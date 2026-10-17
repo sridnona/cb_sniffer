@@ -171,6 +171,7 @@ class GenomicPosition:
 		"""
 		for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
 										truncate=True, stepper="nofilter", max_depth=100000000,
+										multiple_iterators=False,  # one pileup at a time; CRAM warns otherwise
 										min_base_quality=0):
 			for read in pileupcolumn.pileups:
 				if read.is_del or read.is_refskip or not keep(read.alignment):
@@ -453,6 +454,12 @@ def die(msg):
 	sys.exit(1)
 
 
+def is_cram(path):
+	""":return: True if path is a CRAM file, judged by content"""
+	with open(path, 'rb') as f:
+		return f.read(4) == b'CRAM'
+
+
 def is_vcf(path):
 	"""
 	:param path: variant file
@@ -507,7 +514,7 @@ def read_variants(path, pass_only=False):
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
-	parser.add_argument('bam_file', help='BAM file')
+	parser.add_argument('bam_file', help='BAM or CRAM file (CRAM requires -r)')
 	parser.add_argument('variant_file', help='variants: tsv file with header, or VCF/BCF (optionally gzipped)')
 	parser.add_argument('barcodes', help='list of good barcodes file')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
@@ -519,7 +526,8 @@ if __name__ == '__main__':
 						help='Skip bases with base quality less than default : 1')
 	parser.add_argument('-r', '--reference',
 						help='reference FASTA (indexed, may be bgzipped); used to left-align '
-							 'indels so ones in repeats are found wherever the aligner put them')
+							 'indels so ones in repeats are found wherever the aligner put them. '
+							 'Required for CRAM input, which is decoded with it')
 	parser.add_argument("--pass-only", action='store_true',
 						help='VCF input: skip records whose FILTER is not PASS or .')
 
@@ -536,6 +544,9 @@ if __name__ == '__main__':
 					   level=logger.DEBUG,
 					   format='%(asctime)s %(levelname)s %(message)s')
 	logger.info("Start process")
+	cram = is_cram(bam_file)
+	if cram and not args.reference:
+		die("{}: CRAM input requires a reference FASTA (-r/--reference)".format(bam_file))
 	variant_list = list(read_variants(variants, args.pass_only))
 	logger.info("Number of variants:\t{}".format(len(variant_list)))
 	fasta = None
@@ -555,7 +566,8 @@ if __name__ == '__main__':
 	with open(outfile + '_AllCounts.tsv', 'w+') as var, \
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
 			open(outfile + '_counts_UB.tsv', 'w+') as UB, \
-			pysam.AlignmentFile(bam_file, 'rb') as bam:  # opened once for all variants
+			pysam.AlignmentFile(bam_file, 'rc' if cram else 'rb',  # opened once for all variants
+								reference_filename=args.reference if cram else None) as bam:
 		# write headers
 		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 					  'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']

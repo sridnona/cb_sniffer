@@ -15,7 +15,7 @@ usage: cb_sniffer.py [-h] [-f FILTER] [-mq MAPQ] [-bq BASEQ] [-r REFERENCE]
 Parse CB barcodes from Single cell rna seq data
 
 positional arguments:
-  bam_file              BAM file
+  bam_file              BAM or CRAM file (CRAM requires -r)
   variant_file          variants: tsv file with header, or VCF/BCF (optionally
                         gzipped)
   barcodes              list of good barcodes file
@@ -32,10 +32,14 @@ options:
   -r REFERENCE, --reference REFERENCE
                         reference FASTA (indexed, may be bgzipped); used to
                         left-align indels so ones in repeats are found
-                        wherever the aligner put them
+                        wherever the aligner put them. Required for CRAM
+                        input, which is decoded with it
   --pass-only           VCF input: skip records whose FILTER is not PASS or .
 
 ```
+#### BAM or CRAM
+An indexed BAM or CRAM from Cell Ranger, with `CB` and `UB` tags. A CRAM needs `-r`, and the run stops with an error without it. The FASTA must be the reference the CRAM was compressed against, and it's also used for indel left-alignment.
+
 #### Variant file
 Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-separated file with a header line. The format is detected from the file contents.
 
@@ -67,7 +71,7 @@ Shared padding bases are trimmed, so `TG` / `CG` is counted as the SNV `T` / `C`
 For multi-base substitutions, only reads covering every base without a gap are counted, and every base must pass `-bq`.
 
 #### Reference (`-r`)
-An indexed FASTA (`samtools faidx`; bgzipped is fine). It's used to left-align indels, both the variant and each read's indels, so an indel in a repeat matches wherever the aligner placed it in the repeat.
+An indexed FASTA (`samtools faidx`; bgzipped is fine). Required for CRAM input. It's used to left-align indels, both the variant and each read's indels, so an indel in a repeat matches wherever the aligner placed it in the repeat.
 For a ref read, the read must span the whole repeat with no indel or splice in it; reads ending inside the repeat are neither ref nor alt.
 Without `-r`, indels are matched only at the exact position given, and a warning is printed.
 SNPs and multi-base substitutions don't use the reference.
