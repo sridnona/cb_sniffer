@@ -9,6 +9,7 @@ It contains only reads overlapping the six sites in `variants.tsv` (1,476 reads,
 | `variants.tsv` | Six sites (see below), indels in dash notation |
 | `variants_vcf.tsv` | Four of the same sites written VCF-style, with padding bases. Each must give the same counts as its `variants.tsv` counterpart |
 | `variants.vcf` | The same sites as a VCF, plus a second ALT allele at 13625741, a `LowQual` record (15268954, for `--pass-only`), a record with no ID, and a symbolic `<DEL>` that should be skipped |
+| `reference.fa.gz` (+ `.fai`, `.gzi`) | Contig `1` of mm10 up to 15.27 Mb, all N except ±3 kb around each site (~70 KB). For `-r` |
 | `barcodes.tsv` | 246 of the 327 cell barcodes in the BAM. About every 4th barcode is left out so the barcode filter has reads to drop. |
 
 ## Sites
@@ -16,7 +17,7 @@ It contains only reads overlapping the six sites in `variants.tsv` (1,476 reads,
 | Site | Type | What it exercises |
 |------|------|-------------------|
 | `1:12904213 C>-` (Slco5a1) | 1-bp deletion in a C homopolymer | Deletion branch (reads with `is_del`) |
-| `1:13562395 ->A` (Tram1) | 1-bp insertion in an A homopolymer | Insertion branch. The aligner places the insertion inconsistently in the repeat (issues.md #10) |
+| `1:13562395 ->A` (Tram1) | 1-bp insertion in an A homopolymer | Insertion branch. The aligner places the insertion inconsistently in the `AAA` run: with `-r`, 2 more reads are alt (ref/alt reads 14/12 instead of 16/10) |
 | `1:13625741 T>C` (Lactb2) | SNV, ~50% VAF | SNP branch. Many spliced reads span the site (`is_refskip`) and many bases have BQ 0 |
 | `1:15268954 T>C` (Gm10566) | SNV | Includes multimapping reads with MAPQ 1 or 3, so `-mq` changes the result |
 | `1:10000001 T>G` | No coverage | Zero-depth handling (VAF 0.0) |
@@ -44,6 +45,7 @@ python3 cb_sniffer.py -mq 10 test/test.bam test/variants.tsv test/barcodes.tsv m
 python3 cb_sniffer.py -bq 30 test/test.bam test/variants.tsv test/barcodes.tsv bq30
 python3 cb_sniffer.py test/test.bam test/variants_vcf.tsv test/barcodes.tsv vcf
 python3 cb_sniffer.py --pass-only test/test.bam test/variants.vcf test/barcodes.tsv vcf_pass
+python3 cb_sniffer.py -r test/reference.fa.gz test/test.bam test/variants.tsv test/barcodes.tsv ref
 ```
 
 Results with VCF-style/MNP support added (`UB_DEPTH / UB_ALT` from `*_AllCounts.tsv`):

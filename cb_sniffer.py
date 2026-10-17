@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 import gzip
 import pysam
 import logging as logger
@@ -90,22 +90,6 @@ class GenomicPosition:
 		"""
 		return self.kind
 
-	def deletion_length(self, read):
-		"""
-		:return: length of the read's deletion that starts at the variant's
-		first deleted base, or None if it has no deletion starting there
-		"""
-		target = self.pos - 1  # 0-based
-		ref_pos = read.alignment.reference_start
-		for op, n in read.alignment.cigartuples:
-			if op == 2 and ref_pos == target:  # D
-				return n
-			if op in (0, 2, 3, 7, 8):  # M D N = X consume the reference
-				ref_pos += n
-			if ref_pos > target:
-				return None
-		return None
-
 	def read_allele(self, read, baseq):
 		"""
 		bases a read carries across a snp/mnp
@@ -140,128 +124,96 @@ class GenomicPosition:
 				barc[lines] = 1
 		return barc
 
-	def count_barcodes(self, bam_fil, bar, mapq=0, baseq=0):
+	def count_barcodes(self, pile, bar, mapq=0, baseq=0, fasta=None):
 		"""
 
-		:param bam_fil: bam_file
+		:param pile: open pysam.AlignmentFile
 		:param bar: good barcodes dict
 		:param mapq: mapping quality
-		:param baseq: base quality
-		:return: two dicts 1) list of all barcodes at given var pos
-		2) dict with ref and alt barcodes
+		:param baseq: base quality (snp/mnp only)
+		:param fasta: pysam.FastaFile used to left-align indels, or None
+		:return: two dicts 1) CB:UB barcodes of all counted reads, by read name
+		2) dict with ref and alt CB:UB barcodes
 		"""
-		barcodes = defaultdict(list)  # CB
-		# ======================================
 		barUcodes = defaultdict(list)  # UB
 		bar_count = {'ref': [], 'alt': []}  # UB
-		# indel length, 0 for snp/mnp
-		indel = len(self.var_alt) if self.kind == 'ins' else len(self.var_ref) if self.kind == 'del' else 0
-		with pysam.AlignmentFile(bam_fil, 'rb') as pile:
-			logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
-				self.chrm,self.start, self.end, self.ref, self.alt, self.gene, self.event))
+		logger.info("processing variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
+			self.chrm,self.start, self.end, self.ref, self.alt, self.gene, self.event))
+		mapq = int(mapq)
 
-			for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
-											truncate=True, stepper="nofilter", max_depth=100000000,
-											min_base_quality=0):
-				for read in pileupcolumn.pileups:
+		def keep(aln):
+			# cheap filters, checked before working out a read's allele
+			if aln.mapping_quality < mapq:
+				return False
+			try:
+				return aln.get_tag('CB') in bar and aln.has_tag('UB')  # only good barcodes
+			except KeyError:  # no CB tag
+				return False
 
-					if read.alignment.has_tag('CB') and read.alignment.has_tag('UB'):
-						if read.alignment.get_tag('CB') not in bar:  # filter reads with only good barcodes
-							continue
-							
-						# print(read.query_position)
-						if indel > 0:
-							# print(int(read.alignment.query_qualities[read.query_position]))
-
-							# print('{}'.format(read.query_position))
-							# if read.query_position == None:
-							# 	continue
-							# if read.alignment.query_qualities[read.query_position + indel + 1] == None:
-							# 	continue
-							if read.is_refskip or \
-							int(read.alignment.mapping_quality) < int(mapq):
-								continue
-							# a different deletion over this position is neither ref nor alt
-							if self.kind == 'del' and read.is_del and self.deletion_length(read) != indel:
-								continue
-						else:
-
-							if read.is_del or read.is_refskip or \
-							int(read.alignment.mapping_quality) < int(mapq):
-								continue
-							allele = self.read_allele(read, baseq)
-							# reads with a third allele (or N, or part of an mnp) are neither ref nor alt
-							if allele not in (self.var_ref, self.var_alt):
-								continue
-
-						q_name = read.alignment.query_name
-						q_tag = read.alignment.get_tag('CB')
-						qU_tag = read.alignment.get_tag('UB')
-						qstring = q_tag + ':' + qU_tag
-						barcodes['{}'.format(q_name)].append(q_tag)
-						barUcodes['{}'.format(q_name)].append(qstring)
-
-						# barcode without mutations
-						if indel > 0:
-							
-							# print('{}:{}:{}:{}:{}:{}'.format(read.indel, read.alignment.get_tag('CB'),read.alignment.cigarstring,
-							# 	read.query_position,self.alt,pileupcolumn.pos))
-							if self.kind == 'del':
-								if read.alignment.has_tag('CB') and read.query_position == None:
-								# and read.indel == indel and \
-								# 				read.alignment.query_alignment_sequence[read.query_position +
-								# 						1:read.query_position + read.indel + 1] == self.alt:
-									# print('indel length', read.indel)
-									alt_tag = read.alignment.get_tag('CB')
-									# UB
-									altU_tag = read.alignment.get_tag('UB')
-									ustringa = alt_tag + ':' + altU_tag
-									bar_count['alt'].append(ustringa)
-								else:  # ref reads
-									# CB
-									ref_tag = read.alignment.get_tag('CB')
-									# UB
-									refU_tag = read.alignment.get_tag('UB')
-									ustring = ref_tag + ':' + refU_tag
-									bar_count['ref'].append(ustring)
-									# print(ustring)
-									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
-							else:
-								if read.alignment.has_tag('CB') and read.indel == indel and \
-									read.alignment.query_sequence[read.query_position +
-										1:read.query_position + read.indel + 1] == self.var_alt:
-									# print('indel length', read.indel)
-									alt_tag = read.alignment.get_tag('CB')
-									# UB
-									altU_tag = read.alignment.get_tag('UB')
-									ustringa = alt_tag + ':' + altU_tag
-									bar_count['alt'].append(ustringa)
-								else:  # ref reads
-									# CB
-									ref_tag = read.alignment.get_tag('CB')
-									# UB
-									refU_tag = read.alignment.get_tag('UB')
-									ustring = ref_tag + ':' + refU_tag
-									bar_count['ref'].append(ustring)
-									# print(ustring)
-									# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
-						else:
-							#print(indel,read.query_position,read.alignment.query_sequence[read.query_position])
-							if allele == self.var_ref:
-								ref_tag = read.alignment.get_tag('CB')
-								# UB
-								refU_tag = read.alignment.get_tag('UB')
-								ustring = ref_tag + ':' + refU_tag
-								bar_count['ref'].append(ustring)
-								# print('{}\t{}\t{}'.format(ref_tag, refU_tag, 'ref'))
-							else:
-								# CB
-								alt_tag = read.alignment.get_tag('CB')
-								# UB
-								altU_tag = read.alignment.get_tag('UB')
-								ustringa = alt_tag + ':' + altU_tag
-								bar_count['alt'].append(ustringa)
+		if self.kind in ('ins', 'del'):
+			ref = None
+			if fasta is not None:
+				ref = RefWindow(fasta, self.chrm, self.pos - 1, self.pos + len(self.var_ref))
+			reads = self.indel_reads(pile, ref, keep)
+		else:
+			reads = self.snp_reads(pile, baseq, keep)
+		for aln, allele in reads:
+			ustring = aln.get_tag('CB') + ':' + aln.get_tag('UB')
+			barUcodes[aln.query_name].append(ustring)
+			bar_count[allele].append(ustring)
 		return barUcodes, bar_count
+
+	def snp_reads(self, pile, baseq, keep):
+		"""
+		:param keep: function, False for reads to skip before checking their allele
+		:return: generator of (alignment, 'ref' or 'alt') for a snp/mnp
+		reads with a third allele (or N, or part of an mnp) are neither ref nor alt
+		"""
+		for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
+										truncate=True, stepper="nofilter", max_depth=100000000,
+										min_base_quality=0):
+			for read in pileupcolumn.pileups:
+				if read.is_del or read.is_refskip or not keep(read.alignment):
+					continue
+				allele = self.read_allele(read, baseq)
+				if allele == self.var_ref:
+					yield read.alignment, 'ref'
+				elif allele == self.var_alt:
+					yield read.alignment, 'alt'
+
+	def indel_event(self):
+		"""
+		:return: the variant as (p, seq, ref_len), see left_align()
+		"""
+		if self.kind == 'del':
+			return self.pos - 1, self.var_ref, len(self.var_ref)
+		return self.pos, self.var_alt, 0
+
+	def indel_reads(self, pile, ref, keep):
+		"""
+		:param ref: RefWindow around the variant, or None to match indels
+		 only at the exact position given
+		:param keep: function, False for reads to skip before checking their allele
+		:return: generator of (alignment, 'ref' or 'alt') for an insertion/deletion
+
+		The variant and each read's indels are left-aligned, so an indel the
+		aligner placed elsewhere in a repeat still matches. A ref read must
+		span the whole repeat (every position the indel could be placed at)
+		with no indel or splice in it; other reads are neither ref nor alt.
+		"""
+		p, seq, ref_len = self.indel_event()
+		if ref is not None and ref_len and ref.bases(p, ref_len) != seq:
+			warn("deleted bases don't match the reference ({}): {}\t{}\t{}\t{}".format(
+				ref.bases(p, ref_len), self.chrm, self.start, self.ref, self.alt))
+		variant = left_align(p, seq, ref) + (ref_len,)
+		right = right_align(p, seq, ref_len, ref)[0]
+		lo, hi = variant[0] - 1, right + ref_len  # ref bases flanking the repeat
+		for aln in pile.fetch(self.chrm, lo, hi + 1):
+			if not keep(aln):
+				continue
+			allele = indel_allele(aln, lo, hi, variant, ref)
+			if allele:
+				yield aln, allele
 
 	def consensus_calling(self,total_barcodes, ub_counts, wt, wu, wc):
 		"""
@@ -275,26 +227,22 @@ class GenomicPosition:
 
 		"""
 		uniqub_barcodes_raw = set()  # uni depth
-		ub_raw = []  # raw depth
 
 		for tupru in total_barcodes.values():
-			for sampleru in tupru:
-				ub_raw.append(sampleru)
-				uniqub_barcodes_raw.add(sampleru)
+			uniqub_barcodes_raw.update(tupru)
+		# reads per CB:UB, counted once rather than per UMI
+		ref_reads = Counter(ub_counts['ref'])
+		alt_reads = Counter(ub_counts['alt'])
 		# UB ====================================================================================================
 		logger.info("Consensus calc variant: {}\t{}\t{}\t{}\t{}\t{}\t{}".format(
 			self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
 		d = {}
 		UBuniq_barcodes_raw = []
 		for utags in uniqub_barcodes_raw:
-			if utags in ub_counts['alt'] and utags in ub_counts['ref']:
-				# print 'both: ', utags)
-				unref = ub_counts['ref'].count(utags)
-				unalt = ub_counts['alt'].count(utags)
-				utotl = unref + unalt
-				un1ref = ub_counts['ref'].count(utags)
-				un1alt = ub_counts['alt'].count(utags)
-				ut1totl = un1ref + un1alt
+			unref = ref_reads[utags]
+			unalt = alt_reads[utags]
+			utotl = unref + unalt
+			if unref and unalt:
 				if unref / utotl < float(0.75):
 					if unalt / utotl < float(0.75):
 						continue
@@ -317,16 +265,10 @@ class GenomicPosition:
 				# meaning if a UB occurs more than once consider it only once
 				# i.e if UB has 5 [alt] and 0[ref]
 				# we would consider it 1[alt] and 0[ref]
-				un1ref = list(set(ub_counts['ref'])).count(utags)
-				# same stuff for alt UB barcodes
-				un1alt = list(set(ub_counts['alt'])).count(utags)
+				# (the UB file still gets the actual read counts, unref/unalt)
+				un1ref = int(unref > 0)
+				un1alt = int(unalt > 0)
 				u1totl = un1ref + un1alt
-				# although we Uniq the UB's above we need to print out the actual number
-				# UB has 5 [alt] and 0[ref]
-				# print out the same number
-				unref = ub_counts['ref'].count(utags)
-				unalt = ub_counts['alt'].count(utags)
-				utotl = unref + unalt
 
 			if un1alt:  # append only alt barcodes that have 1
 				UBuniq_barcodes_raw.append(utags)
@@ -410,6 +352,96 @@ class GenomicPosition:
 		return snp
 
 
+class RefWindow:
+	"""reference bases around a variant, using 0-based coordinates"""
+
+	def __init__(self, fasta, chrm, start, end, pad=1000):
+		self.start = max(0, start - pad)
+		self.seq = fasta.fetch(chrm, self.start, end + pad).upper()
+
+	def base(self, i):
+		i -= self.start
+		return self.seq[i] if 0 <= i < len(self.seq) else None
+
+	def bases(self, i, n):
+		return self.seq[i - self.start:i - self.start + n]
+
+
+def left_align(p, seq, ref):
+	"""
+	shift an indel left as far as it stays equivalent
+	:param p: 0-based first reference base the indel affects: the first deleted
+	 base for a deletion, the base after the inserted bases for an insertion
+	:param seq: deleted or inserted bases
+	:param ref: RefWindow, or None to leave the indel where it is
+	:return: (p, seq) after shifting
+	"""
+	while ref is not None and seq and ref.base(p - 1) == seq[-1]:
+		seq = seq[-1] + seq[:-1]
+		p -= 1
+	return p, seq
+
+
+def right_align(p, seq, ref_len, ref):
+	"""
+	shift an indel right as far as it stays equivalent
+	:param ref_len: len(seq) for a deletion, 0 for an insertion
+	:return: (p, seq) after shifting, see left_align()
+	"""
+	while ref is not None and seq and ref.base(p + ref_len) == seq[0]:
+		seq = seq[1:] + seq[0]
+		p += 1
+	return p, seq
+
+
+def indel_allele(aln, lo, hi, variant, ref):
+	"""
+	:param aln: pysam.AlignedSegment
+	:param lo, hi: 0-based reference bases flanking the repeat the indel is in
+	:param variant: left-aligned (p, seq, ref_len) of the variant
+	:param ref: RefWindow or None
+	:return: 'alt' if the read's only indel between lo and hi is the variant,
+	 'ref' if the read is aligned at lo and hi with no indel or splice
+	 between them, otherwise None
+	"""
+	r, q = aln.reference_start, 0
+	events = []
+	covered = 0
+	for op, n in aln.cigartuples:
+		if op in (0, 7, 8):  # M = X
+			covered += (r <= lo < r + n) + (r <= hi < r + n)
+			r += n
+			q += n
+		elif op == 1:  # I
+			if lo < r <= hi:
+				if aln.query_sequence is None:
+					return None
+				events.append((r, aln.query_sequence[q:q + n], 0))
+			q += n
+		elif op in (2, 3):  # D N
+			if r <= hi and r + n > lo:
+				if op == 3:
+					return None  # spliced across the repeat
+				events.append((r, ref.bases(r, n) if ref is not None else None, n))
+			r += n
+		elif op == 4:  # S
+			q += n
+	if not events:
+		return 'ref' if covered == 2 else None
+	if len(events) > 1:
+		return None
+	r_p, r_seq, r_len = events[0]
+	v_p, v_seq, v_len = variant
+	if r_len != v_len or (r_len == 0 and len(r_seq) != len(v_seq)):
+		return None  # different type or length
+	if ref is None:
+		# deleted bases aren't known without the reference
+		same = r_p == v_p and (r_len > 0 or r_seq == v_seq)
+	else:
+		same = left_align(r_p, r_seq, ref) == (v_p, v_seq)
+	return 'alt' if same else None
+
+
 def warn(msg):
 	logger.warning(msg)
 	print('WARNING: ' + msg, file=sys.stderr)
@@ -485,6 +517,9 @@ if __name__ == '__main__':
 						help='Skip read with mapq smaller than default : 0')
 	parser.add_argument('-bq', "--baseq", type=int, default=1,
 						help='Skip bases with base quality less than default : 1')
+	parser.add_argument('-r', '--reference',
+						help='reference FASTA (indexed, may be bgzipped); used to left-align '
+							 'indels so ones in repeats are found wherever the aligner put them')
 	parser.add_argument("--pass-only", action='store_true',
 						help='VCF input: skip records whose FILTER is not PASS or .')
 
@@ -503,13 +538,24 @@ if __name__ == '__main__':
 	logger.info("Start process")
 	variant_list = list(read_variants(variants, args.pass_only))
 	logger.info("Number of variants:\t{}".format(len(variant_list)))
+	fasta = None
+	indel_chroms = {x.chrm for x in variant_list if x.kind in ('ins', 'del')}
+	if args.reference:
+		fasta = pysam.FastaFile(args.reference)
+		missing = sorted(indel_chroms - set(fasta.references))
+		if missing:
+			die("{}: no sequence for chromosome(s) {}".format(args.reference, ', '.join(missing)))
+	elif indel_chroms:
+		warn("no --reference given: indels are only counted at the exact position given, "
+			 "not elsewhere in a repeat")
 
 	num_lines_barcode = sum(1 for lines in open(barcodes_good))
 	logger.info("Number of good barcodes:\t{}".format(num_lines_barcode))
 	bars = GenomicPosition.good_barcodes(barcodes_good)
 	with open(outfile + '_AllCounts.tsv', 'w+') as var, \
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
-			open(outfile + '_counts_UB.tsv', 'w+') as UB:
+			open(outfile + '_counts_UB.tsv', 'w+') as UB, \
+			pysam.AlignmentFile(bam_file, 'rb') as bam:  # opened once for all variants
 		# write headers
 		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 					  'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
@@ -532,7 +578,7 @@ if __name__ == '__main__':
 				warn("skipping unsupported variant (ref and alt differ in length "
 					 "after trimming shared bases): {}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
 				continue
-			barcode_counts = x.count_barcodes(bam_file, bars, mq, bq)
+			barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta)
 			# print(check_classify[0])
 			counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
 

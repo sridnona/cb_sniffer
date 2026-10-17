@@ -21,10 +21,11 @@ BAM = os.path.join(TEST_DIR, 'test.bam')
 VARIANTS = os.path.join(TEST_DIR, 'variants.tsv')
 VARIANTS_VCF = os.path.join(TEST_DIR, 'variants_vcf.tsv')
 VCF = os.path.join(TEST_DIR, 'variants.vcf')
+REFERENCE = os.path.join(TEST_DIR, 'reference.fa.gz')  # N except +-3 kb around the sites
 BARCODES = os.path.join(TEST_DIR, 'barcodes.tsv')
 
 sys.path.insert(0, REPO_DIR)
-from cb_sniffer import GenomicPosition, is_vcf, read_variants  # noqa: E402
+from cb_sniffer import GenomicPosition, is_vcf, read_variants, left_align, right_align  # noqa: E402
 
 DEL, INS, SNV, SNV_MQ, NOCOV, MNP = 12904213, 13562395, 13625741, 15268954, 10000001, 10066353
 # start position of each site in variants_vcf.tsv -> the same site in variants.tsv
@@ -304,11 +305,28 @@ def test_insertion_ignores_baseq(tmp_path, default_run):
 	assert read_counts(high, INS) == read_counts(default_run['counts_UB'], INS)
 
 
-def run_synthetic(tmp_path, reads, variant_line):
+def read_from_ref(refseq, cigar, start=80):
+	"""read sequence matching refseq for a cigar, with A for inserted bases"""
+	import pysam
+	a = pysam.AlignedSegment()
+	a.cigarstring = cigar
+	seq, r = '', start
+	for op, n in a.cigartuples:
+		if op in (0, 7, 8):
+			seq += refseq[r:r + n]
+		elif op in (1, 4):
+			seq += 'A' * n
+		if op in (0, 2, 3, 7, 8):
+			r += n
+	return seq
+
+
+def run_synthetic(tmp_path, reads, variant_line, refseq=None):
 	"""
 	Write reads to a BAM (each its own cell and UMI, all starting at 1-based
 	position 81 on contig 1), run cb_sniffer on one variant and return its
-	AllCounts row. reads: list of (cigar, sequence or None for all A's).
+	AllCounts row. reads: list of (cigar, sequence or None). A None sequence
+	is all A's, or follows refseq when given; refseq is also passed as -r.
 	"""
 	import pysam
 	bam = str(tmp_path / 'synthetic.bam')
@@ -317,7 +335,9 @@ def run_synthetic(tmp_path, reads, variant_line):
 		for i, (cigar, seq) in enumerate(reads):
 			a = pysam.AlignedSegment()
 			a.query_name, a.cigarstring = 'read{}'.format(i), cigar
-			a.query_sequence = seq or 'A' * a.infer_query_length()
+			if seq is None:
+				seq = read_from_ref(refseq, cigar) if refseq else 'A' * a.infer_query_length()
+			a.query_sequence = seq
 			a.reference_id, a.reference_start, a.mapping_quality = 0, 80, 255
 			a.query_qualities = pysam.qualitystring_to_array('F' * len(a.query_sequence))
 			a.set_tags([('CB', 'CELL{}-1'.format(i)), ('UB', 'UMI{}'.format(i))])
@@ -325,8 +345,13 @@ def run_synthetic(tmp_path, reads, variant_line):
 	pysam.index(bam)
 	(tmp_path / 'bc.tsv').write_text(''.join('CELL{}-1\n'.format(i) for i in range(len(reads))))
 	(tmp_path / 'v.tsv').write_text('chrm\tstart\tstop\tref\tvar\tgene\ttype\n' + variant_line + '\n')
-	subprocess.run([sys.executable, SCRIPT, bam, 'v.tsv', 'bc.tsv', 'out'],
-				   cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL)
+	opts = []
+	if refseq:
+		(tmp_path / 'ref.fa').write_text('>1\n' + refseq + '\n')
+		pysam.faidx(str(tmp_path / 'ref.fa'))
+		opts = ['-r', 'ref.fa']
+	subprocess.run([sys.executable, SCRIPT, *opts, bam, 'v.tsv', 'bc.tsv', 'out'],
+				   cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 	return read_tsv(str(tmp_path / 'out_AllCounts.tsv'))[0]
 
 
@@ -352,9 +377,9 @@ def test_deletion_must_match(tmp_path, variant_line):
 		('19M2D20M', None),   # 2-bp deletion starting at 100: skipped
 		('18M2D20M', None),   # deletion starting at 99, covers 100: skipped
 		('40M', None),        # no deletion: ref
-		('20M1D20M', None),   # deletion at 101, base 100 present: ref
+		('20M1D20M', None),   # deletion at 101: doesn't span the site, skipped
 	], variant_line)
-	assert (row['UB_DEPTH'], row['UB_ALT']) == ('3', '1')
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('2', '1')
 	assert row['CB_barcodes'] == 'CELL0-1'
 
 
@@ -385,13 +410,105 @@ def test_mnp_partial_alleles_skipped(tmp_path):
 	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('2', '1', '0.5')
 
 
-@pytest.mark.parametrize('cigar,expected', [
-	('19M1D20M', 1), ('19M2D20M', 2), ('18M2D20M', None), ('40M', None),
-	('20M1D20M', None), ('5S19M1D20M', 1), ('10M5N4M1D20M', 1),
+class FakeRef:
+	"""stands in for RefWindow, over a plain string starting at 0"""
+	def __init__(self, seq):
+		self.seq = seq
+
+	def base(self, i):
+		return self.seq[i] if 0 <= i < len(self.seq) else None
+
+	def bases(self, i, n):
+		return self.seq[i:i + n]
+
+
+@pytest.mark.parametrize('p,seq,ref_len,left,right', [
+	# ref: TTAAAAATT; positions 2-6 are A
+	(4, 'A', 1, (2, 'A'), (6, 'A')),         # 1-bp deletion in the run
+	(6, 'A', 0, (2, 'A'), (7, 'A')),         # 1-bp insertion before base 6
+	(8, 'T', 1, (7, 'T'), (8, 'T')),         # deletion after the run
+	(3, 'AA', 2, (2, 'AA'), (5, 'AA')),      # 2-bp deletion
 ])
-def test_deletion_length(cigar, expected):
-	read = make_read(cigar, start=81)
-	assert variant('A', '-').deletion_length(read) == expected
+def test_left_right_align_homopolymer(p, seq, ref_len, left, right):
+	ref = FakeRef('TTAAAAATT')
+	assert left_align(p, seq, ref) == left
+	assert right_align(p, seq, ref_len, ref) == right
+
+
+def test_left_align_dinucleotide_repeat():
+	ref = FakeRef('GGCACACAGG')  # CA repeat at 2-7
+	assert left_align(6, 'CA', ref) == (2, 'CA')   # deletion of the last CA
+	assert left_align(5, 'AC', ref) == (2, 'CA')   # same deletion, written shifted by one
+	assert right_align(2, 'CA', 2, ref) == (6, 'CA')
+	assert left_align(8, 'CA', ref) == (2, 'CA')   # insertion of CA after the repeat
+	assert left_align(4, 'AC', ref) == (4, 'AC')   # no reference: unchanged
+	assert left_align(4, 'AC', None) == (4, 'AC')
+
+
+REPEAT_REF = 'T' * 95 + 'AAAAA' + 'T' * 900  # A run at 1-based 96-100
+
+
+@pytest.mark.parametrize('use_ref,expected', [(True, ('3', '2')), (False, ('4', '1'))])
+def test_deletion_in_repeat(tmp_path, use_ref, expected):
+	"""issues.md #10: with a reference, a deletion anywhere in the run matches"""
+	row = run_synthetic(tmp_path, [
+		('15M1D24M', None),   # deletion of 96, the first A: alt
+		('19M1D20M', None),   # deletion of 100, the last A: alt only with -r
+		('40M', None),        # spans the run: ref
+		('18M', None),        # ends at 98, inside the run: ref only without -r
+		('15M2D23M', None),   # 2-bp deletion: neither
+	], '1\t96\t96\tA\t-\tg\tdeletion', REPEAT_REF if use_ref else None)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == expected
+
+
+@pytest.mark.parametrize('use_ref,expected', [(True, ('3', '2')), (False, ('3', '1'))])
+def test_insertion_in_repeat(tmp_path, use_ref, expected):
+	"""issues.md #10: with a reference, an insertion anywhere in the run matches"""
+	reads = [
+		('15M1I25M', None),   # A inserted after 95 (before the run): alt
+		('20M1I20M', None),   # A inserted after 100 (end of the run): alt with -r, else ref
+		('40M', None),        # ref
+	]
+	if not use_ref:
+		reads = [(c, read_from_ref(REPEAT_REF, c)) for c, _ in reads]
+	row = run_synthetic(tmp_path, reads, '1\t95\t95\t-\tA\tg\tinsertion',
+						REPEAT_REF if use_ref else None)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == expected
+
+
+def test_reference_insertion_in_repeat_real_data(tmp_path, default_run):
+	"""the test insertion is in an AAA run; two soft-clipped reads put it at the start"""
+	with_ref = run(tmp_path, '-r', REFERENCE)
+	assert read_counts(default_run['counts_UB'], INS) == (16, 10)
+	assert read_counts(with_ref['counts_UB'], INS) == (14, 12)
+	# the deletion is already left-aligned in every read
+	assert read_counts(with_ref['counts_UB'], DEL) == read_counts(default_run['counts_UB'], DEL)
+	# snp/mnp counts don't use the reference
+	for site in (SNV, SNV_MQ, NOCOV, MNP):
+		assert normalized(by_site(with_ref['AllCounts'])[site]) == \
+			normalized(by_site(default_run['AllCounts'])[site])
+
+
+def test_reference_missing_chromosome_dies(tmp_path):
+	(tmp_path / 'ref.fa').write_text('>2\nACGT\n')
+	cmd = [sys.executable, SCRIPT, '-r', 'ref.fa', BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+	assert result.returncode == 1
+	assert 'no sequence for chromosome(s) 1' in result.stderr
+
+
+def test_deletion_reference_mismatch_warns(tmp_path):
+	variants = tmp_path / 'v.tsv'
+	variants.write_text('chrm\tstart\tstop\tref\tvar\tgene\ttype\n1\t12904213\t12904213\tG\t-\tg\tdel\n')
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
+	assert "deleted bases don't match the reference (C)" in result.stderr
+
+
+def test_no_reference_warns_for_indels(tmp_path):
+	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
+	assert 'no --reference given' in result.stderr
 
 
 def test_vcf_style_matches_dash(tmp_path, default_run):
