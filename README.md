@@ -110,8 +110,19 @@ pysam (version pinned in `requirements.txt`)
 
 Docker image
 ----------
-* sridnona/python3:180925.v1
+[mgibio/cb_sniffer](https://hub.docker.com/r/mgibio/cb_sniffer) (built from the `Dockerfile` in this repo; linux/amd64). The image puts a `cb_sniffer` command on the `PATH`.
 
 ```{shell}
-LSF_DOCKER_PRESERVE_ENVIRONMENT=false bsub -Is -q research-hpc -a "docker(sridnona/python3:180925.v1)" /bin/bash
+docker run --rm -v $PWD:/data -w /data mgibio/cb_sniffer \
+    cb_sniffer -r ref.fa sample.bam variants.vcf barcodes.tsv.gz sample
+```
+
+On LSF:
+```{shell}
+LSF_DOCKER_PRESERVE_ENVIRONMENT=false bsub -Is -q research-hpc -a "docker(mgibio/cb_sniffer)" /bin/bash
+```
+
+To build it yourself:
+```{shell}
+docker build --platform linux/amd64 -t mgibio/cb_sniffer .
 ```

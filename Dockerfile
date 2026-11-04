@@ -1,4 +1,10 @@
+# Published as mgibio/cb_sniffer. Build for amd64 (also from an Apple Silicon Mac):
+#   docker build --platform linux/amd64 -t mgibio/cb_sniffer:<version> .
 FROM python:3.11-slim
+
+LABEL org.opencontainers.image.title="cb_sniffer" \
+      org.opencontainers.image.description="Counts ref and alt cell barcodes and UMIs at variant sites in 10x single-cell BAM/CRAM files" \
+      org.opencontainers.image.source="https://github.com/chrisamiller/cb_sniffer"
 
 # procps provides `ps`, which some HPC/LSF docker wrappers expect
 RUN apt-get update \
