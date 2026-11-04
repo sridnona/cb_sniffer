@@ -604,6 +604,23 @@ def test_gzipped_barcodes(tmp_path, default_run):
 	assert [normalized(r) for r in rows] == [normalized(r) for r in default_run['AllCounts']]
 
 
+def test_output_order_is_reproducible(tmp_path):
+	"""barcode lists and CB/UB row order don't depend on Python's per-process hash seed"""
+	outputs = []
+	for seed in ('1', '2'):
+		d = tmp_path / seed
+		d.mkdir()
+		cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, VCF, BARCODES, 'out']
+		subprocess.run(cmd, cwd=str(d), check=True, stdout=subprocess.DEVNULL,
+					   stderr=subprocess.DEVNULL, env=dict(os.environ, PYTHONHASHSEED=seed))
+		outputs.append([(d / 'out_{}.tsv'.format(n)).read_text()
+						for n in ('AllCounts', 'counts_CB', 'counts_UB')])
+	assert outputs[0] == outputs[1]
+	ub = read_tsv(str(tmp_path / '1' / 'out_counts_UB.tsv'))
+	site = [r['barcode'] for r in ub if r['start'] == str(SNV) and r['alt'] == 'C']
+	assert site and site == sorted(site)
+
+
 # --- CRAM input ----------------------------------------------------------------
 
 # keep htslib from finding the reference anywhere but -r (no cache, no EBI download)

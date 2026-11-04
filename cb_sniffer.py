@@ -241,7 +241,8 @@ class GenomicPosition:
 			self.chrm, self.start, self.end, self.ref, self.alt, self.gene, self.event))
 		d = {}
 		UBuniq_barcodes_raw = []
-		for utags in uniqub_barcodes_raw:
+		# sorted so output order is the same on every run (set order varies per process)
+		for utags in sorted(uniqub_barcodes_raw):
 			unref = ref_reads[utags]
 			unalt = alt_reads[utags]
 			utotl = unref + unalt
@@ -301,7 +302,7 @@ class GenomicPosition:
 		uni_alt = []
 		tuni_alt = []
 		CBuniq_barcodes_raw = []
-		for i, v in d.items():
+		for i, v in sorted(d.items()):
 			# print i,v['alt']
 			if v['alt'] >= 1:
 				CBuniq_barcodes_raw.append(i)
