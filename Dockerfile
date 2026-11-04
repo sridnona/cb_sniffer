@@ -5,9 +5,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends procps \
     && rm -rf /var/lib/apt/lists/*
 
-# pysam 0.14.1 (requirements.txt) has no wheels for modern Python; the APIs
-# used by cb_sniffer are unchanged in current releases
-RUN pip install --no-cache-dir pysam==0.22.1
+COPY requirements.txt /opt/cb_sniffer/requirements.txt
+RUN pip install --no-cache-dir -r /opt/cb_sniffer/requirements.txt
 
 COPY cb_sniffer.py /opt/cb_sniffer/cb_sniffer.py
 RUN printf '#!/bin/sh\nexec python3 /opt/cb_sniffer/cb_sniffer.py "$@"\n' > /usr/local/bin/cb_sniffer \

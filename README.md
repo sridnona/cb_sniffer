@@ -106,7 +106,7 @@ Dependencies
 -------
 
 python3  
-pysam  
+pysam (version pinned in `requirements.txt`)  
 
 Docker image
 ----------
