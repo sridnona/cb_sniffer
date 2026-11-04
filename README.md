@@ -8,8 +8,7 @@ Usage
 ----
 ```{shell}
 python3 cb_sniffer.py -h
-usage: cb_sniffer.py [-h] [-f FILTER] [-mq MAPQ] [-bq BASEQ] [-r REFERENCE]
-                     [--pass-only]
+usage: cb_sniffer.py [-h] [-mq MAPQ] [-bq BASEQ] [-r REFERENCE] [--pass-only]
                      bam_file variant_file barcodes upn
 
 Parse CB barcodes from Single cell rna seq data
@@ -23,8 +22,6 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  -f FILTER, --filter FILTER
-                        number of reads required per barcode default: 0
   -mq MAPQ, --mapq MAPQ
                         Skip read with mapq smaller than default : 0
   -bq BASEQ, --baseq BASEQ

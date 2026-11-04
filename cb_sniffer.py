@@ -550,8 +550,6 @@ if __name__ == '__main__':
 	parser.add_argument('variant_file', help='variants: tsv file (header line optional), or VCF/BCF (optionally gzipped)')
 	parser.add_argument('barcodes', help='list of good barcodes file (may be gzipped)')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
-	parser.add_argument('-f', "--filter", type=int, default=0,
-						help='number of reads required per barcode default: 0')
 	parser.add_argument('-mq', "--mapq", type=int, default=0,
 						help='Skip read with mapq smaller than default : 0')
 	parser.add_argument('-bq', "--baseq", type=int, default=1,
@@ -569,7 +567,6 @@ if __name__ == '__main__':
 	variants = args.variant_file
 	barcodes_good = args.barcodes
 	outfile = args.upn
-	counts = args.filter
 	bq = args.baseq
 	mq = args.mapq
 	logger.basicConfig(filename=outfile + '.log', filemode='w+',
