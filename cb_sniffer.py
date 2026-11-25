@@ -457,6 +457,15 @@ def die(msg):
 	sys.exit(1)
 
 
+def chrom_alias(name):
+	""":return: the name under the other naming convention: 'chr1' <-> '1', 'chrM' <-> 'MT'"""
+	if name == 'chrM':
+		return 'MT'
+	if name == 'MT':
+		return 'chrM'
+	return name[3:] if name.startswith('chr') else 'chr' + name
+
+
 def is_cram(path):
 	""":return: True if path is a CRAM file, judged by content"""
 	with open(path, 'rb') as f:
@@ -618,7 +627,14 @@ if __name__ == '__main__':
 				warn("skipping unsupported variant (ref and alt differ in length "
 					 "after trimming shared bases): {}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
 				continue
-			barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta)
+			try:
+				barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta)
+			except ValueError as e:
+				alias = chrom_alias(x.chrm)
+				if 'invalid contig' not in str(e) or alias not in bam.references:
+					raise
+				raise ValueError("invalid contig {0}  - Are the naming conventions different between "
+								 "the variants and the bam ({0} vs {1})?".format(x.chrm, alias)) from None
 			# print(check_classify[0])
 			counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
 

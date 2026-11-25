@@ -511,6 +511,40 @@ def test_no_reference_warns_for_indels(tmp_path):
 	assert 'no --reference given' in result.stderr
 
 
+@pytest.mark.parametrize('name,alias', [
+	('chr1', '1'), ('1', 'chr1'), ('chrX', 'X'), ('X', 'chrX'), ('chrM', 'MT'), ('MT', 'chrM'),
+])
+def test_chrom_alias(name, alias):
+	from cb_sniffer import chrom_alias
+	assert chrom_alias(name) == alias
+
+
+def run_with_first_chrom(tmp_path, chrom):
+	"""run with the first variant moved to another chromosome name"""
+	lines = open(VARIANTS).read().splitlines()
+	lines[1] = chrom + lines[1][1:]
+	variants = tmp_path / 'v.tsv'
+	variants.write_text('\n'.join(lines) + '\n')
+	cmd = [sys.executable, SCRIPT, BAM, str(variants), BARCODES, 'out']
+	return subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+
+
+def test_chr_prefix_mismatch_error(tmp_path):
+	"""variant file says chr1, the BAM says 1: the error suggests the naming mismatch"""
+	result = run_with_first_chrom(tmp_path, 'chr1')
+	assert result.returncode != 0
+	assert ('ValueError: invalid contig chr1  - Are the naming conventions different '
+			'between the variants and the bam (chr1 vs 1)?') in result.stderr
+
+
+def test_unknown_contig_error_unchanged(tmp_path):
+	"""no hint when the BAM doesn't have the contig under the other name either"""
+	result = run_with_first_chrom(tmp_path, 'contigZ')
+	assert result.returncode != 0
+	assert 'invalid contig' in result.stderr
+	assert 'naming conventions' not in result.stderr
+
+
 def test_vcf_style_matches_dash(tmp_path, default_run):
 	vcf = by_site(run(tmp_path, variants=VARIANTS_VCF)['AllCounts'])
 	dash = by_site(default_run['AllCounts'])
