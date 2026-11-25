@@ -1,0 +1,5 @@
+chrm	start	stop	ref	var	gene_name	trv_type
+1	12904212	12904216	ACCCC	ACCC	Slco5a1	deletion
+1	13562395	13562395	A	AA	Tram1	insertion
+1	13625741	13625742	TG	CG	Lactb2	snp
+1	10066352	10066356	CTATG	CCATA	Cspp1	mnp

@@ -1,0 +1,15 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=195471971>
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=LowQual,Description="Low quality">
+##ALT=<ID=DEL,Description="Deletion">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="SV type">
+##INFO=<ID=END,Number=1,Type=Integer,Description="End">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	10000001	.	T	G	.	.	.
+1	10066352	Cspp1	CTATG	CCATA	.	PASS	.
+1	12904212	Slco5a1	ACCCC	ACCC	.	PASS	.
+1	13562395	Tram1	A	AA	.	PASS	.
+1	13625741	Lactb2	T	C,G	.	PASS	.
+1	13625741	sv1	T	<DEL>	.	PASS	SVTYPE=DEL;END=13625800
+1	15268954	Gm10566	T	C	.	LowQual	.
