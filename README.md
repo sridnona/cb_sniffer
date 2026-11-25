@@ -34,18 +34,20 @@ options:
   --pass-only           VCF input: skip records whose FILTER is not PASS or .
   --atac                scATAC BAM (no UB/UMI tags): count each fragment (read
                         pair) once in place of a UMI, and skip duplicate,
-                        secondary, supplementary and QC-fail reads
+                        secondary and QC-fail reads
 
 ```
 #### BAM or CRAM
 An indexed BAM or CRAM from Cell Ranger, with `CB` and `UB` tags. For a CRAM, the `-r` FASTA must be the reference it was compressed against.
 
-If none of the reads with a listed barcode have a `UB` tag, the run stops and suggests `--atac`. (Before this check, an scATAC BAM gave empty output with no error.)
+Each read is counted at most once per variant. Where a read is split into several alignments, the primary alignment's call is used, and a supplementary (0x800) or secondary (0x100) alignment counts only when the primary doesn't cover the site, as with split reads across a large deletion or a fusion junction. (CellRanger BAMs usually have none, but long-read single-cell BAMs from minimap2 often do)
+
+The default is to assume the input bam is from scRNA and has CB and UB tags. If none of the reads with a listed barcode have a `UB` tag, the run stops and suggests `--atac`.
 
 #### scATAC and Multiome (`--atac`)
 scATAC BAMs (Cell Ranger ATAC or ARC) have `CB` tags but no `UB` UMIs. With `--atac`:
 - Each fragment (read name) takes the place of a UMI. Both mates of a pair are counted, and the 75% consensus rule is applied per fragment, so overlapping mates count once and a fragment whose mates disagree is dropped.
-- Reads flagged duplicate (0x400), secondary (0x100), supplementary (0x800) or QC-fail (0x200) are skipped.
+- Reads flagged duplicate (0x400), secondary (0x100) or QC-fail (0x200) are skipped. Supplementary reads are handled as described above.
 - The output columns are unchanged: in `_counts_UB.tsv` and the `CB:UB_barcodes` column, the barcode is `CB:read_name`.
 - For Multiome (ARC) runs, Cell Ranger translates ATAC barcodes to their paired gene expression barcodes, so the same barcode list works for both BAMs.
 - ATAC reads are aligned with bwa (MAPQ 0-60), so `-mq 30` is a reasonable filter.

@@ -135,8 +135,8 @@ class GenomicPosition:
 		:param baseq: base quality (snp/mnp only)
 		:param fasta: pysam.FastaFile, used to left-align indels and realign reads at them
 		:param atac: scATAC mode: there are no UMIs, so each fragment (read
-		 name) stands in for a UMI, and secondary, QC-fail, duplicate and
-		 supplementary reads are skipped
+		 name) stands in for a UMI, and secondary, QC-fail and duplicate
+		 reads are skipped
 		:return: two dicts 1) CB:UB barcodes of all counted reads, by read name
 		2) dict with ref and alt CB:UB barcodes (CB:read name in atac mode)
 		"""
@@ -165,7 +165,7 @@ class GenomicPosition:
 			# in atac mode keep both mates where they overlap; they're one
 			# fragment, and consensus_calling() drops it if they disagree
 			reads = self.snp_reads(pile, baseq, keep, ignore_overlaps=not atac)
-		for aln, allele in reads:
+		for aln, allele in read_once(reads):
 			ustring = aln.get_tag('CB') + ':' + (aln.query_name if atac else aln.get_tag('UB'))
 			barUcodes[aln.query_name].append(ustring)
 			bar_count[allele].append(ustring)
@@ -612,8 +612,27 @@ class Haplotypes:
 		return None
 
 
-# reads skipped in atac mode: secondary, QC fail, duplicate, supplementary
-ATAC_SKIP_FLAGS = 0x100 | 0x200 | 0x400 | 0x800
+# reads skipped in atac mode: secondary, QC fail, duplicate
+ATAC_SKIP_FLAGS = 0x100 | 0x200 | 0x400
+
+
+def read_once(calls):
+	"""
+	Keep one call per read at a site. Reads split into several alignments
+	(supplementary, or secondary) could otherwise be counted more than once.
+	The primary alignment's call wins; a supplementary or secondary one is 
+        used only when the primary has no coverage of the variant site
+	:param calls: iterable of (alignment, allele)
+	:return: list of (alignment, allele), in the order first seen
+	"""
+	best = {}
+	for aln, allele in calls:
+		# read name and which mate it is
+		key = (aln.query_name, aln.flag & 0xC0)
+		rank = 2 if aln.is_secondary else 1 if aln.is_supplementary else 0
+		if key not in best or rank < best[key][0]:
+			best[key] = (rank, aln, allele)
+	return [(aln, allele) for _, aln, allele in best.values()]
 
 
 def has_umis(bam, variants, bar, sample=1000):
@@ -773,8 +792,8 @@ if __name__ == '__main__':
 						help='VCF input: skip records whose FILTER is not PASS or .')
 	parser.add_argument("--atac", action='store_true',
 						help='scATAC BAM (no UB/UMI tags): count each fragment (read pair) '
-							 'once in place of a UMI, and skip duplicate, secondary, '
-							 'supplementary and QC-fail reads')
+							 'once in place of a UMI, and skip duplicate, secondary '
+							 'and QC-fail reads')
 
 	args = parser.parse_args()
 
