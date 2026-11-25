@@ -126,7 +126,7 @@ class GenomicPosition:
 					barc[lines] = 1
 		return barc
 
-	def count_barcodes(self, pile, bar, mapq=0, baseq=0, fasta=None):
+	def count_barcodes(self, pile, bar, mapq=0, baseq=0, fasta=None, atac=False):
 		"""
 
 		:param pile: open pysam.AlignmentFile
@@ -134,8 +134,11 @@ class GenomicPosition:
 		:param mapq: mapping quality
 		:param baseq: base quality (snp/mnp only)
 		:param fasta: pysam.FastaFile used to left-align indels, or None
+		:param atac: scATAC mode: there are no UMIs, so each fragment (read
+		 name) stands in for a UMI, and secondary, QC-fail, duplicate and
+		 supplementary reads are skipped
 		:return: two dicts 1) CB:UB barcodes of all counted reads, by read name
-		2) dict with ref and alt CB:UB barcodes
+		2) dict with ref and alt CB:UB barcodes (CB:read name in atac mode)
 		"""
 		barUcodes = defaultdict(list)  # UB
 		bar_count = {'ref': [], 'alt': []}  # UB
@@ -147,8 +150,11 @@ class GenomicPosition:
 			# cheap filters, checked before working out a read's allele
 			if aln.mapping_quality < mapq:
 				return False
+			if atac and aln.flag & ATAC_SKIP_FLAGS:
+				return False
 			try:
-				return aln.get_tag('CB') in bar and aln.has_tag('UB')  # only good barcodes
+				# only good barcodes
+				return aln.get_tag('CB') in bar and (atac or aln.has_tag('UB'))
 			except KeyError:  # no CB tag
 				return False
 
@@ -158,23 +164,27 @@ class GenomicPosition:
 				ref = RefWindow(fasta, self.chrm, self.pos - 1, self.pos + len(self.var_ref))
 			reads = self.indel_reads(pile, ref, keep)
 		else:
-			reads = self.snp_reads(pile, baseq, keep)
+			# in atac mode keep both mates where they overlap; they're one
+			# fragment, and consensus_calling() drops it if they disagree
+			reads = self.snp_reads(pile, baseq, keep, ignore_overlaps=not atac)
 		for aln, allele in reads:
-			ustring = aln.get_tag('CB') + ':' + aln.get_tag('UB')
+			ustring = aln.get_tag('CB') + ':' + (aln.query_name if atac else aln.get_tag('UB'))
 			barUcodes[aln.query_name].append(ustring)
 			bar_count[allele].append(ustring)
 		return barUcodes, bar_count
 
-	def snp_reads(self, pile, baseq, keep):
+	def snp_reads(self, pile, baseq, keep, ignore_overlaps=True):
 		"""
 		:param keep: function, False for reads to skip before checking their allele
+		:param ignore_overlaps: where read mates overlap, let htslib keep only
+		 the higher-quality base (it zeroes the other mate's base quality)
 		:return: generator of (alignment, 'ref' or 'alt') for a snp/mnp
 		reads with a third allele (or N, or part of an mnp) are neither ref nor alt
 		"""
 		for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
 										truncate=True, stepper="nofilter", max_depth=100000000,
 										multiple_iterators=False,  # one pileup at a time; CRAM warns otherwise
-										min_base_quality=0):
+										min_base_quality=0, ignore_overlaps=ignore_overlaps):
 			for read in pileupcolumn.pileups:
 				if read.is_del or read.is_refskip or not keep(read.alignment):
 					continue
@@ -446,6 +456,36 @@ def indel_allele(aln, lo, hi, variant, ref):
 	return 'alt' if same else None
 
 
+# reads skipped in atac mode: secondary, QC fail, duplicate, supplementary
+ATAC_SKIP_FLAGS = 0x100 | 0x200 | 0x400 | 0x800
+
+
+def has_umis(bam, variants, bar, sample=1000):
+	"""
+	look at reads around the variants for UB (UMI) tags
+	:param bam: open pysam.AlignmentFile
+	:param variants: list of GenomicPosition
+	:param bar: good barcodes dict
+	:param sample: stop after this many reads with a good CB barcode
+	:return: True if any of them has a UB tag, False if none do, None if
+	 no reads with a good CB barcode were found
+	"""
+	seen = 0
+	refs = set(bam.references)
+	for x in variants:
+		if x.chrm not in refs:
+			continue  # reported when the variant is counted
+		for aln in bam.fetch(x.chrm, max(0, x.pos - 1), x.pos + 1):
+			if not aln.has_tag('CB') or aln.get_tag('CB') not in bar:
+				continue
+			if aln.has_tag('UB'):
+				return True
+			seen += 1
+			if seen >= sample:
+				return False
+	return False if seen else None
+
+
 def warn(msg):
 	logger.warning(msg)
 	print('WARNING: ' + msg, file=sys.stderr)
@@ -560,6 +600,10 @@ if __name__ == '__main__':
 							 'Required for CRAM input, which is decoded with it')
 	parser.add_argument("--pass-only", action='store_true',
 						help='VCF input: skip records whose FILTER is not PASS or .')
+	parser.add_argument("--atac", action='store_true',
+						help='scATAC BAM (no UB/UMI tags): count each fragment (read pair) '
+							 'once in place of a UMI, and skip duplicate, secondary, '
+							 'supplementary and QC-fail reads')
 
 	args = parser.parse_args()
 
@@ -591,11 +635,18 @@ if __name__ == '__main__':
 
 	bars = GenomicPosition.good_barcodes(barcodes_good)
 	logger.info("Number of good barcodes:\t{}".format(len(bars)))
-	with open(outfile + '_AllCounts.tsv', 'w+') as var, \
+	bam = pysam.AlignmentFile(bam_file, 'rc' if cram else 'rb',  # opened once for all variants
+							  reference_filename=args.reference if cram else None)
+	umis = has_umis(bam, variant_list, bars)
+	if umis is False and not args.atac:
+		die("{}: none of the reads with a listed CB barcode have a UB (UMI) tag. "
+			"scATAC BAMs have no UMIs: rerun with --atac".format(bam_file))
+	if umis and args.atac:
+		warn("{}: --atac given, but reads have UB (UMI) tags; is this a scRNA BAM? "
+			 "Counting fragments, not UMIs".format(bam_file))
+	with bam, open(outfile + '_AllCounts.tsv', 'w+') as var, \
 			open(outfile + '_counts_CB.tsv', 'w+') as CB, \
-			open(outfile + '_counts_UB.tsv', 'w+') as UB, \
-			pysam.AlignmentFile(bam_file, 'rc' if cram else 'rb',  # opened once for all variants
-								reference_filename=args.reference if cram else None) as bam:
+			open(outfile + '_counts_UB.tsv', 'w+') as UB:
 		# write headers
 		var_header = ['chr', 'start', 'end', 'ref', 'alt', 'type', 'gene',
 					  'UB_DEPTH', 'UB_ALT', 'UB_VAF', 'CB_barcodes', 'CB:UB_barcodes']
@@ -618,7 +669,7 @@ if __name__ == '__main__':
 				warn("skipping unsupported variant (ref and alt differ in length "
 					 "after trimming shared bases): {}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
 				continue
-			barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta)
+			barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta, args.atac)
 			# print(check_classify[0])
 			counters = x.consensus_calling(barcode_counts[0], barcode_counts[1], var, UB, CB)
 

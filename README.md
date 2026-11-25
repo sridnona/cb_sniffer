@@ -9,6 +9,7 @@ Usage
 ```{shell}
 python3 cb_sniffer.py -h
 usage: cb_sniffer.py [-h] [-mq MAPQ] [-bq BASEQ] [-r REFERENCE] [--pass-only]
+                     [--atac]
                      bam_file variant_file barcodes upn
 
 Parse CB barcodes from Single cell rna seq data
@@ -32,10 +33,26 @@ options:
                         wherever the aligner put them. Required for CRAM
                         input, which is decoded with it
   --pass-only           VCF input: skip records whose FILTER is not PASS or .
+  --atac                scATAC BAM (no UB/UMI tags): count each fragment (read
+                        pair) once in place of a UMI, and skip duplicate,
+                        secondary, supplementary and QC-fail reads
 
 ```
 #### BAM or CRAM
 An indexed BAM or CRAM from Cell Ranger, with `CB` and `UB` tags. A CRAM needs `-r`, and the run stops with an error without it. The FASTA must be the reference the CRAM was compressed against, and it's also used for indel left-alignment.
+
+If none of the reads with a listed barcode have a `UB` tag, the run stops and suggests `--atac`. (Before this check, an scATAC BAM gave empty output with no error.)
+
+#### scATAC and Multiome (`--atac`)
+scATAC BAMs (Cell Ranger ATAC or ARC) have `CB` tags but no `UB` UMIs. With `--atac`:
+- Each fragment (read name) takes the place of a UMI. Both mates of a pair are counted, and the 75% consensus rule is applied per fragment, so overlapping mates count once and a fragment whose mates disagree is dropped.
+- Reads flagged duplicate (0x400), secondary (0x100), supplementary (0x800) or QC-fail (0x200) are skipped.
+- The output columns are unchanged: in `_counts_UB.tsv` and the `CB:UB_barcodes` column, the barcode is `CB:read_name`.
+- For Multiome (ARC) runs, Cell Ranger translates ATAC barcodes to their paired gene expression barcodes, so the same barcode list works for both BAMs.
+- ATAC reads are aligned with bwa (MAPQ 0-60), so `-mq 30` is a reasonable filter.
+- ATAC coverage at any one site is sparse, and outside open chromatin there may be no reads at all; expect far fewer cells per variant than with scRNA.
+
+If `--atac` is given but the reads have `UB` tags, a warning is printed and reads are still counted per fragment, not per UMI.
 
 #### Variant file
 Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-separated file. The format is detected from the file contents.
@@ -94,7 +111,7 @@ AAACCTGCATAAGACA-1
 ### Output files 
     1. variant list with barcodes supporting a variant :_AllCounts.tsv
     2. read counts for Chromium cellular barcode sequence(CB_tag) : _counts_CB.tsv
-    3. read counts for Chromium molecular barcode(UB_tag): _counts_UB.tsv  
+    3. read counts for Chromium molecular barcode(UB_tag): _counts_UB.tsv (with --atac: per fragment)
 
 
 * Additional info on tags
