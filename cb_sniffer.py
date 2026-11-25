@@ -133,7 +133,7 @@ class GenomicPosition:
 		:param bar: good barcodes dict
 		:param mapq: mapping quality
 		:param baseq: base quality (snp/mnp only)
-		:param fasta: pysam.FastaFile used to left-align indels, or None
+		:param fasta: pysam.FastaFile, used to left-align indels and realign reads at them
 		:param atac: scATAC mode: there are no UMIs, so each fragment (read
 		 name) stands in for a UMI, and secondary, QC-fail, duplicate and
 		 supplementary reads are skipped
@@ -159,9 +159,7 @@ class GenomicPosition:
 				return False
 
 		if self.kind in ('ins', 'del'):
-			ref = None
-			if fasta is not None:
-				ref = RefWindow(fasta, self.chrm, self.pos - 1, self.pos + len(self.var_ref))
+			ref = RefWindow(fasta, self.chrm, self.pos - 1, self.pos + len(self.var_ref))
 			reads = self.indel_reads(pile, ref, keep)
 		else:
 			# in atac mode keep both mates where they overlap; they're one
@@ -204,27 +202,31 @@ class GenomicPosition:
 
 	def indel_reads(self, pile, ref, keep):
 		"""
-		:param ref: RefWindow around the variant, or None to match indels
-		 only at the exact position given
+		:param ref: RefWindow around the variant
 		:param keep: function, False for reads to skip before checking their allele
 		:return: generator of (alignment, 'ref' or 'alt') for an insertion/deletion
 
-		The variant and each read's indels are left-aligned, so an indel the
-		aligner placed elsewhere in a repeat still matches. A ref read must
-		span the whole repeat (every position the indel could be placed at)
-		with no indel or splice in it; other reads are neither ref nor alt.
+		The repeat the indel is in (every position it could be placed at) is
+		found by left- and right-aligning it. A read whose CIGAR is clean
+		across the repeat and FLANK bases either side is called from the CIGAR
+		(see indel_allele()). Any other read near the indel (soft-clipped near
+		it, ending near it, with mismatches or other indels near it) is
+		realigned to the ref and alt haplotypes instead (see Haplotypes).
+		Reads that fit neither clearly better are neither ref nor alt.
 		"""
 		p, seq, ref_len = self.indel_event()
-		if ref is not None and ref_len and ref.bases(p, ref_len) != seq:
-			warn("deleted bases don't match the reference ({}): {}\t{}\t{}\t{}".format(
-				ref.bases(p, ref_len), self.chrm, self.start, self.ref, self.alt))
 		variant = left_align(p, seq, ref) + (ref_len,)
 		right = right_align(p, seq, ref_len, ref)[0]
 		lo, hi = variant[0] - 1, right + ref_len  # ref bases flanking the repeat
-		for aln in pile.fetch(self.chrm, lo, hi + 1):
+		haps = Haplotypes(ref, variant, lo, hi)
+		# a read aligned just short of the repeat can still reach it with a soft clip
+		reach = len(seq) + FLANK
+		for aln in pile.fetch(self.chrm, max(0, lo - reach), hi + reach + 1):
 			if not keep(aln):
 				continue
 			allele = indel_allele(aln, lo, hi, variant, ref)
+			if allele is REALIGN:
+				allele = haps.allele(aln)
 			if allele:
 				yield aln, allele
 
@@ -372,6 +374,7 @@ class RefWindow:
 	def __init__(self, fasta, chrm, start, end, pad=1000):
 		self.start = max(0, start - pad)
 		self.seq = fasta.fetch(chrm, self.start, end + pad).upper()
+		self.end = self.start + len(self.seq)
 
 	def base(self, i):
 		i -= self.start
@@ -387,10 +390,10 @@ def left_align(p, seq, ref):
 	:param p: 0-based first reference base the indel affects: the first deleted
 	 base for a deletion, the base after the inserted bases for an insertion
 	:param seq: deleted or inserted bases
-	:param ref: RefWindow, or None to leave the indel where it is
+	:param ref: RefWindow
 	:return: (p, seq) after shifting
 	"""
-	while ref is not None and seq and ref.base(p - 1) == seq[-1]:
+	while seq and ref.base(p - 1) == seq[-1]:
 		seq = seq[-1] + seq[:-1]
 		p -= 1
 	return p, seq
@@ -402,58 +405,211 @@ def right_align(p, seq, ref_len, ref):
 	:param ref_len: len(seq) for a deletion, 0 for an insertion
 	:return: (p, seq) after shifting, see left_align()
 	"""
-	while ref is not None and seq and ref.base(p + ref_len) == seq[0]:
+	while seq and ref.base(p + ref_len) == seq[0]:
 		seq = seq[1:] + seq[0]
 		p += 1
 	return p, seq
 
 
+# a read's CIGAR is trusted at an indel only if it's aligned, with no clip,
+# splice or mismatch, across the repeat, and this many bases further on any
+# side where the alignment stops at a clip or splice
+FLANK = 5
+# realignment scores, BWA-MEM's defaults: a gap of k bases costs
+# GAP_OPEN + k * GAP_EXTEND
+MATCH, MISMATCH, GAP_OPEN, GAP_EXTEND = 1, -4, 6, 1
+# a realigned read must score this much better against one haplotype than
+# the other to be called
+MIN_MARGIN = 3
+# returned by indel_allele() for reads that need realigning
+REALIGN = object()
+
+
 def indel_allele(aln, lo, hi, variant, ref):
 	"""
+	call a read from its CIGAR, if the CIGAR can be trusted
 	:param aln: pysam.AlignedSegment
 	:param lo, hi: 0-based reference bases flanking the repeat the indel is in
 	:param variant: left-aligned (p, seq, ref_len) of the variant
-	:param ref: RefWindow or None
-	:return: 'alt' if the read's only indel between lo and hi is the variant,
-	 'ref' if the read is aligned at lo and hi with no indel or splice
-	 between them, otherwise None
+	:param ref: RefWindow
+	:return: if the read is aligned with no clip, splice or mismatch across
+	 [lo, hi], reaching FLANK bases further on any side where the alignment
+	 stops at a clip or splice: 'ref' if it has no indel there, 'alt' if its
+	 only indel there is the variant, None if its only indel is something else.
+	 None if it's spliced across the repeat. Otherwise REALIGN
 	"""
+	query = aln.query_sequence
+	if query is None:
+		return None
+	a, b = lo - FLANK, hi + FLANK
 	r, q = aln.reference_start, 0
+	# stretches of the alignment without a clip or splice:
+	# (first ref base, ref base after the last, starts at a clip, ends at a clip)
+	runs = []
+	run, cut = None, False
+	clean = True
 	events = []
-	covered = 0
 	for op, n in aln.cigartuples:
+		if op in (0, 2, 7, 8) and run is None:
+			run = [r, cut]
 		if op in (0, 7, 8):  # M = X
-			covered += (r <= lo < r + n) + (r <= hi < r + n)
+			for i in range(max(r, a), min(r + n, b + 1)):
+				if query[q + i - r] != ref.base(i):
+					clean = False
 			r += n
 			q += n
 		elif op == 1:  # I
-			if lo < r <= hi:
-				if aln.query_sequence is None:
-					return None
-				events.append((r, aln.query_sequence[q:q + n], 0))
+			if a < r <= b:
+				events.append((r, query[q:q + n], 0))
 			q += n
-		elif op in (2, 3):  # D N
-			if r <= hi and r + n > lo:
-				if op == 3:
-					return None  # spliced across the repeat
-				events.append((r, ref.bases(r, n) if ref is not None else None, n))
+		elif op == 2:  # D
+			if r <= b and r + n > a:
+				events.append((r, ref.bases(r, n), n))
 			r += n
-		elif op == 4:  # S
-			q += n
+		elif op in (3, 4, 5):  # N S H
+			if op == 3 and r <= hi and r + n > lo:
+				return None  # spliced across the repeat
+			if run is not None:
+				runs.append((run[0], r, run[1], True))
+			run, cut = None, True
+			if op == 3:
+				r += n
+			elif op == 4:
+				q += n
+	if run is not None:
+		runs.append((run[0], r, run[1], False))
+	covered = any(s <= (a if cut_s else lo) and e > (b if cut_e else hi)
+				  for s, e, cut_s, cut_e in runs)
+	if not covered or not clean or len(events) > 1:
+		return REALIGN
 	if not events:
-		return 'ref' if covered == 2 else None
-	if len(events) > 1:
-		return None
+		return 'ref'
 	r_p, r_seq, r_len = events[0]
+	in_repeat = (r_p <= hi and r_p + r_len > lo) if r_len else lo < r_p <= hi
+	if not in_repeat:
+		return REALIGN  # an indel next to the repeat, not in it
 	v_p, v_seq, v_len = variant
-	if r_len != v_len or (r_len == 0 and len(r_seq) != len(v_seq)):
+	if r_len != v_len or len(r_seq) != len(v_seq):
 		return None  # different type or length
-	if ref is None:
-		# deleted bases aren't known without the reference
-		same = r_p == v_p and (r_len > 0 or r_seq == v_seq)
-	else:
-		same = left_align(r_p, r_seq, ref) == (v_p, v_seq)
-	return 'alt' if same else None
+	return 'alt' if left_align(r_p, r_seq, ref) == (v_p, v_seq) else None
+
+
+def local_score(q, t):
+	"""
+	:return: best local (Smith-Waterman, affine gap) alignment score of
+	 sequences q and t. N matches anything with score 0
+	"""
+	first, ext = GAP_OPEN + GAP_EXTEND, GAP_EXTEND
+	neg = -10 ** 9
+	n = len(t)
+	prev = [0] * (n + 1)  # scores of the previous row
+	f = [neg] * (n + 1)  # best score ending in a gap in t, by column
+	best = 0
+	for x in q:
+		row = [0] * (n + 1)
+		e = neg  # best score ending in a gap in q
+		left = 0
+		for j in range(1, n + 1):
+			y = t[j - 1]
+			if x == y and x != 'N':
+				s = MATCH
+			elif x == 'N' or y == 'N':
+				s = 0
+			else:
+				s = MISMATCH
+			fj = max(prev[j] - first, f[j] - ext)
+			f[j] = fj
+			e = max(left - first, e - ext)
+			h = max(0, prev[j - 1] + s, e, fj)
+			row[j] = left = h
+			if h > best:
+				best = h
+		prev = row
+	return best
+
+
+class Haplotypes:
+	"""
+	ref and alt sequence around an indel, to realign reads whose CIGAR
+	can't be trusted (see indel_allele())
+	"""
+
+	def __init__(self, ref, variant, lo, hi):
+		"""
+		:param ref: RefWindow
+		:param variant: left-aligned (p, seq, ref_len) of the variant
+		:param lo, hi: 0-based reference bases flanking the repeat the indel is in
+		"""
+		self.p, seq, self.n = variant
+		self.lo, self.hi = lo, hi
+		self.ins = '' if self.n else seq
+		self.trim = len(seq) + 20  # query bases kept either side of the repeat
+		self.band = len(seq) + 10  # extra reference bases either side of them
+		pad = self.trim + self.band + 10
+		self.start = max(ref.start, lo - pad)
+		self.end = min(ref.end, hi + 1 + pad)
+		self.ref = ref.bases(self.start, self.end - self.start)
+		self.alt = (ref.bases(self.start, self.p - self.start) + self.ins +
+					ref.bases(self.p + self.n, self.end - self.p - self.n))
+
+	def alt_index(self, x):
+		""":return: index in self.alt of 0-based reference base x"""
+		if x < self.p:
+			return x - self.start
+		if x >= self.p + self.n:
+			return x - self.start - self.n + len(self.ins)
+		return self.p - self.start  # deleted
+
+	def allele(self, aln):
+		"""
+		realign the part of a read near the indel to both haplotypes
+		:param aln: pysam.AlignedSegment
+		:return: 'ref' or 'alt' if it scores at least MIN_MARGIN better against
+		 that haplotype, otherwise None
+		"""
+		query = aln.query_sequence
+		if query is None:
+			return None
+		# where each query base would be on the reference: soft-clipped bases
+		# continue the alignment, inserted bases go with the next aligned base.
+		# The read is split into segments at splices
+		segments = [[]]
+		r, q = aln.reference_start, 0
+		aligned = False
+		for op, n in aln.cigartuples:
+			if op in (0, 7, 8):  # M = X
+				segments[-1].extend((q + i, r + i) for i in range(n))
+				r += n
+				q += n
+				aligned = True
+			elif op == 1:  # I
+				segments[-1].extend((q + i, r) for i in range(n))
+				q += n
+			elif op == 2:  # D
+				r += n
+			elif op == 3:  # N
+				segments.append([])
+				r += n
+			elif op == 4:  # S
+				start = r if aligned else r - n
+				segments[-1].extend((q + i, start + i) for i in range(n))
+				q += n
+		near = [s for s in segments if s and s[0][1] <= self.hi and s[-1][1] >= self.lo]
+		if len(near) != 1:
+			return None  # doesn't reach the repeat, or is spliced next to it
+		kept = [(q, r) for q, r in near[0] if self.lo - self.trim <= r <= self.hi + self.trim]
+		if not kept:
+			return None  # deletes the whole stretch
+		sub = query[kept[0][0]:kept[-1][0] + 1]
+		wa = max(self.start, min(kept[0][1], self.lo + 1) - self.band)
+		wb = min(self.end - 1, max(kept[-1][1], self.hi) + self.band)
+		margin = (local_score(sub, self.alt[self.alt_index(wa):self.alt_index(wb) + 1]) -
+				  local_score(sub, self.ref[wa - self.start:wb - self.start + 1]))
+		if margin >= MIN_MARGIN:
+			return 'alt'
+		if margin <= -MIN_MARGIN:
+			return 'ref'
+		return None
 
 
 # reads skipped in atac mode: secondary, QC fail, duplicate, supplementary
@@ -484,6 +640,20 @@ def has_umis(bam, variants, bar, sample=1000):
 			if seen >= sample:
 				return False
 	return False if seen else None
+
+
+def check_ref_allele(x, fasta):
+	"""
+	warn if a variant's ref allele doesn't match the reference
+	:param x: GenomicPosition
+	:param fasta: pysam.FastaFile
+	"""
+	if x.ref == '-':
+		return
+	found = fasta.fetch(x.chrm, x.start - 1, x.start - 1 + len(x.ref)).upper()
+	if found != x.ref.upper():
+		warn("ref allele doesn't match the reference ({}), counting anyway: "
+			 "{}\t{}\t{}\t{}".format(found or 'past the end', x.chrm, x.start, x.ref, x.alt))
 
 
 def warn(msg):
@@ -586,7 +756,7 @@ def read_variants(path, pass_only=False):
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parse CB barcodes from Single cell rna seq data')
-	parser.add_argument('bam_file', help='BAM or CRAM file (CRAM requires -r)')
+	parser.add_argument('bam_file', help='BAM or CRAM file')
 	parser.add_argument('variant_file', help='variants: tsv file (header line optional), or VCF/BCF (optionally gzipped)')
 	parser.add_argument('barcodes', help='list of good barcodes file (may be gzipped)')
 	parser.add_argument('upn', help='upn/sample name: will be used as prefix for out_file')
@@ -594,10 +764,11 @@ if __name__ == '__main__':
 						help='Skip read with mapq smaller than default : 0')
 	parser.add_argument('-bq', "--baseq", type=int, default=1,
 						help='Skip bases with base quality less than default : 1')
-	parser.add_argument('-r', '--reference',
-						help='reference FASTA (indexed, may be bgzipped); used to left-align '
-							 'indels so ones in repeats are found wherever the aligner put them. '
-							 'Required for CRAM input, which is decoded with it')
+	parser.add_argument('-r', '--reference', required=True,
+						help='reference FASTA the reads were aligned to (indexed, may be '
+							 'bgzipped). Used to check variant ref alleles, to find indels '
+							 'wherever the aligner put them in a repeat, to realign '
+							 'soft-clipped reads at indels, and to decode CRAM input')
 	parser.add_argument("--pass-only", action='store_true',
 						help='VCF input: skip records whose FILTER is not PASS or .')
 	parser.add_argument("--atac", action='store_true',
@@ -618,20 +789,14 @@ if __name__ == '__main__':
 					   format='%(asctime)s %(levelname)s %(message)s')
 	logger.info("Start process")
 	cram = is_cram(bam_file)
-	if cram and not args.reference:
-		die("{}: CRAM input requires a reference FASTA (-r/--reference)".format(bam_file))
 	variant_list = list(read_variants(variants, args.pass_only))
 	logger.info("Number of variants:\t{}".format(len(variant_list)))
-	fasta = None
-	indel_chroms = {x.chrm for x in variant_list if x.kind in ('ins', 'del')}
-	if args.reference:
-		fasta = pysam.FastaFile(args.reference)
-		missing = sorted(indel_chroms - set(fasta.references))
-		if missing:
-			die("{}: no sequence for chromosome(s) {}".format(args.reference, ', '.join(missing)))
-	elif indel_chroms:
-		warn("no --reference given: indels are only counted at the exact position given, "
-			 "not elsewhere in a repeat")
+	fasta = pysam.FastaFile(args.reference)
+	missing = sorted({x.chrm for x in variant_list} - set(fasta.references))
+	if missing:
+		die("{}: no sequence for chromosome(s) {}".format(args.reference, ', '.join(missing)))
+	for x in variant_list:
+		check_ref_allele(x, fasta)
 
 	bars = GenomicPosition.good_barcodes(barcodes_good)
 	logger.info("Number of good barcodes:\t{}".format(len(bars)))
