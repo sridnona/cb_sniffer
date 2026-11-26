@@ -953,7 +953,8 @@ ATAC_SNV_READS = (
 	+ mates('fragC', 'CELL2-1', False, False)  # both mates ref: one ref fragment
 	+ mates('fragD', 'CELL2-1', False, True)   # mates disagree: dropped
 	+ [atac_read('dup', 'CELL3-1', True, 0x400),     # duplicate: skipped
-	   atac_read('supp', 'CELL3-1', True, 0x800),    # supplementary: skipped
+	   atac_read('fragB', 'CELL1-1', False, 0x800),  # supplementary of fragB: its primary wins
+	   atac_read('supp', 'CELL3-1', True, 0x800),    # supplementary, primary elsewhere: counted
 	   atac_read('sec', 'CELL3-1', True, 0x100),     # secondary: skipped
 	   atac_read('qcfail', 'CELL3-1', True, 0x200)]  # QC fail: skipped
 )
@@ -971,18 +972,43 @@ def test_atac_counts_fragments(tmp_path):
 	result, rows = run_atac(tmp_path, ATAC_SNV_READS)
 	assert result.returncode == 0, result.stderr
 	row = rows[0]
-	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('3', '2', '0.67')
-	assert row['CB_barcodes'] == 'CELL1-1'
-	assert row['CB:UB_barcodes'] == 'CELL1-1:fragA,CELL1-1:fragB'
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('4', '3', '0.75')
+	assert row['CB_barcodes'] == 'CELL1-1,CELL3-1'
+	assert row['CB:UB_barcodes'] == 'CELL1-1:fragA,CELL1-1:fragB,CELL3-1:supp'
 	ub = read_tsv(str(tmp_path / 'out_counts_UB.tsv'))
 	# read counts per fragment: both mates are counted, the fragment once;
-	# fragD (mates disagree) fails consensus and is left out, like a discordant UMI
+	# fragD (mates disagree) fails consensus and is left out, like a discordant UMI.
+	# fragB's ref supplementary isn't counted, so fragB isn't dropped as discordant
 	assert {r['barcode']: (r['ref_count'], r['alt_count']) for r in ub} == {
 		'CELL1-1:fragA': ('0', '2'), 'CELL1-1:fragB': ('0', '1'),
-		'CELL2-1:fragC': ('2', '0')}
+		'CELL2-1:fragC': ('2', '0'), 'CELL3-1:supp': ('0', '1')}
 	cb = read_tsv(str(tmp_path / 'out_counts_CB.tsv'))
 	assert {r['barcode']: (r['ref_count'], r['alt_count']) for r in cb} == {
-		'CELL1-1': ('0', '2'), 'CELL2-1': ('1', '0')}
+		'CELL1-1': ('0', '2'), 'CELL2-1': ('1', '0'), 'CELL3-1': ('0', '1')}
+
+
+def test_read_once():
+	import pysam
+	from cb_sniffer import read_once
+
+	def aln(name, flag):
+		a = pysam.AlignedSegment()
+		a.query_name, a.flag = name, flag
+		return a
+
+	r1, r2 = 0x1 | 0x40, 0x1 | 0x80
+	calls = [
+		(aln('a', 0x800), 'ref'),        # supplementary first, then its primary: primary wins
+		(aln('a', 0), 'alt'),
+		(aln('b', r1), 'alt'),           # mates are different reads: both kept
+		(aln('b', r2 | 0x800), 'ref'),
+		(aln('c', 0x100), 'ref'),        # secondary loses to supplementary
+		(aln('c', 0x800), 'alt'),
+		(aln('d', 0x800), 'alt'),        # supplementary only: kept
+	]
+	assert [(a.query_name, a.flag, x) for a, x in read_once(calls)] == [
+		('a', 0, 'alt'), ('b', r1, 'alt'), ('b', r2 | 0x800, 'ref'),
+		('c', 0x800, 'alt'), ('d', 0x800, 'alt')]
 
 
 # all A except a C at 1-based 90 and a G at 110, so a 40-base read at 81-120
