@@ -147,13 +147,13 @@ class GenomicPosition:
 		mapq = int(mapq)
 
 		def keep(aln):
-			# cheap filters, checked before working out a read's allele
+			# cheap filters - remove reads before spending the time to look at the allele
 			if aln.mapping_quality < mapq:
 				return False
 			if atac and aln.flag & ATAC_SKIP_FLAGS:
 				return False
 			try:
-				# only good barcodes
+				# only look at known good barcodes
 				return aln.get_tag('CB') in bar and (atac or aln.has_tag('UB'))
 			except KeyError:  # no CB tag
 				return False
@@ -206,13 +206,13 @@ class GenomicPosition:
 		:param keep: function, False for reads to skip before checking their allele
 		:return: generator of (alignment, 'ref' or 'alt') for an insertion/deletion
 
-		The repeat the indel is in (every position it could be placed at) is
-		found by left- and right-aligning it. A read whose CIGAR is clean
-		across the repeat and FLANK bases either side is called from the CIGAR
-		(see indel_allele()). Any other read near the indel (soft-clipped near
-		it, ending near it, with mismatches or other indels near it) is
-		realigned to the ref and alt haplotypes instead (see Haplotypes).
-		Reads that fit neither clearly better are neither ref nor alt.
+		Indel could be in a repeat, so we get all positions that it could be
+		found by left- and right-aligning it. If the CIGAR is clean (across the site
+		and FLANK bases on either side) then allele is called from the CIGAR
+		(see indel_allele()). More complicated reads near the indel (soft-clipped 
+		ending near it, mismatches or other indels near it) are then realigned to
+		the ref and alt haplotypes to see which matches better (see Haplotypes).
+		Reads that fit neither clearly better are not included in the counts.
 		"""
 		p, seq, ref_len = self.indel_event()
 		variant = left_align(p, seq, ref) + (ref_len,)
@@ -243,8 +243,8 @@ class GenomicPosition:
 		"""
 		uniqub_barcodes_raw = set()  # uni depth
 
-		for tupru in total_barcodes.values():
-			uniqub_barcodes_raw.update(tupru)
+		for val in total_barcodes.values():
+			uniqub_barcodes_raw.update(val)
 		# reads per CB:UB, counted once rather than per UMI
 		ref_reads = Counter(ub_counts['ref'])
 		alt_reads = Counter(ub_counts['alt'])
@@ -533,7 +533,7 @@ class Haplotypes:
 	ref and alt sequence around an indel, to realign reads whose CIGAR
 	can't be trusted (see indel_allele())
 	"""
-
+        
 	def __init__(self, ref, variant, lo, hi):
 		"""
 		:param ref: RefWindow
@@ -687,7 +687,7 @@ def die(msg):
 
 
 def is_cram(path):
-	""":return: True if path is a CRAM file, judged by content"""
+	""":return: True if path is a CRAM file"""
 	with open(path, 'rb') as f:
 		return f.read(4) == b'CRAM'
 
@@ -698,14 +698,14 @@ def is_gzipped(path):
 
 
 def open_text(path):
-	"""open a plain or gzipped (judged by content) text file for reading"""
+	"""open a plain or gzipped (autodetected) text file for reading"""
 	return gzip.open(path, 'rt') if is_gzipped(path) else open(path, 'r')
 
 
 def is_vcf(path):
 	"""
 	:param path: variant file
-	:return: True for VCF (plain, gzip or bgzip) or BCF, judged by content
+	:return: True for VCF (plain, gzip or bgzip) or BCF, autodetected
 	"""
 	with (gzip.open(path, 'rb') if is_gzipped(path) else open(path, 'rb')) as f:
 		head = f.read(16)
