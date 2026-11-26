@@ -40,6 +40,8 @@ options:
 #### BAM or CRAM
 An indexed BAM or CRAM from Cell Ranger, with `CB` and `UB` tags. For a CRAM, the `-r` FASTA must be the reference it was compressed against.
 
+Reads flagged QC-fail (0x200) are skipped. Duplicate-flagged reads are kept, since Cell Ranger flags all but one read per UMI and that one often doesn't cover the variant; the per-UMI collapse counts each UMI once anyway.
+
 Each read is counted at most once per variant. Where a read is split into several alignments, the primary alignment's call is used, and a supplementary (0x800) or secondary (0x100) alignment counts only when the primary doesn't cover the site, as with split reads across a large deletion or a fusion junction. (CellRanger BAMs usually have none, but long-read single-cell BAMs from minimap2 often do)
 
 The default is to assume the input bam is from scRNA and has CB and UB tags. If none of the reads with a listed barcode have a `UB` tag, the run stops and suggests `--atac`.
