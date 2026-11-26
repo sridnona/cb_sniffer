@@ -62,7 +62,7 @@ Either a VCF/BCF file (plain, gzipped or bgzipped, no index needed) or a tab-sep
 - Each ALT allele of a multi-allelic record is counted separately, as its own output row.
 - Symbolic (`<DEL>`), breakend and `*` alleles are skipped with a warning.
 - `--pass-only` skips records whose FILTER isn't `PASS` or `.`.
-- In the output, `gene` is the record's `ID` (`.` if missing), and `type` is the variant kind: `snp`, `mnp`, `ins` or `del`.
+- In the output, `gene` is the record's `ID` (`.` if missing), and `type` is the variant kind: `snp`, `mnp`, `ins`, `del` or `complex`.
 - Sample columns are ignored.
 
 ##### TSV
@@ -83,8 +83,9 @@ Accepted `ref`/`var` notations (`start` is 1-based; `stop` isn't used):
 | Insertion, dash style | `-` / `AC` | base before the insertion |
 | Deletion, VCF style | `ACT` / `A` | anchor base (VCF POS) |
 | Insertion, VCF style | `A` / `AAC` | anchor base (VCF POS) |
+| Complex (unequal-length substitution) | `ACCT` / `GCGGGAAA` | first base |
 
-Shared padding bases are trimmed, so `TG` / `CG` is counted as the SNV `T` / `C`. Substitutions whose ref and alt still differ in length after trimming (e.g. `ATC` / `GG`) aren't supported and are skipped with a warning.
+Shared padding bases are trimmed, so `TG` / `CG` is counted as the SNV `T` / `C`, and `ACCT` / `ACGGGAAT` as the complex variant `C` / `GGGAA` at the third base. A variant whose ref and alt are the same is skipped with a warning.
 For multi-base substitutions, only reads covering every base without a gap are counted, and every base must pass `-bq`.
 
 #### Reference (`-r`, required)
@@ -95,6 +96,7 @@ An indexed FASTA (`samtools faidx`; bgzipped is fine): the reference the reads w
 - A read is called from its CIGAR only if it's aligned with no soft clip, splice or mismatch across the whole repeat the indel is in, plus 5 bases further on any side where the alignment stops at a clip or splice. Such a read is ref if it has no indel there, and alt if its only indel there is the variant.
 - Other reads near an indel, such as reads soft-clipped at an insertion or tandem duplication, or reads with a deletion near their end aligned as mismatches, are realigned. The part of the read near the indel, soft clips included, is aligned (Smith-Waterman, with BWA-MEM's scores) to the reference and to the reference with the indel applied. The read is called if it scores at least 3 better against one than the other. Reads that end inside the repeat score the same against both and aren't counted.
 - A read spliced across the repeat isn't counted.
+- Complex variants (ref and alt differ in length after trimming, e.g. `ACCT` / `GCGGGAAA`) can be aligned in many ways: as mismatches plus an insertion or deletion, as a deletion next to an insertion, or soft-clipped. A read is called ref from its CIGAR if it matches the reference across the substitution and 5 bases either side, as above. Every other read that reaches the substitution is realigned to the reference and to the reference with the substitution applied.
 
 SNPs and multi-base substitutions use the reference only for the ref allele check.
 

@@ -49,9 +49,12 @@ class GenomicPosition:
 		  dash indels       C/-            start = first deleted base
 		                    -/A            start = base before the insertion
 		  VCF-style indels  ACT/A, A/AC    start = anchor base (VCF POS)
+		  complex           ATC/GG, ACCT/GCGGGAAA  unequal-length substitution,
+		                    start = first base
 
 		sets:
-		  self.kind     'snp', 'mnp', 'ins', 'del' or 'complex'
+		  self.kind     'snp', 'mnp', 'ins', 'del', 'complex', or 'none' if
+		                ref and alt are the same
 		  self.pos      1-based position to pile up on
 		  self.var_ref  ref bases without padding ('' for an insertion)
 		  self.var_alt  alt bases without padding ('' for a deletion)
@@ -81,13 +84,15 @@ class GenomicPosition:
 				pos -= 1  # pile up on the base before the inserted bases
 		elif ref and len(ref) == len(alt):
 			kind = 'snp' if len(ref) == 1 else 'mnp'
+		elif ref:
+			kind = 'complex'  # unequal-length substitution
 		else:
-			kind = 'complex'  # unequal-length substitution, or ref == alt
+			kind = 'none'  # ref == alt
 		self.kind, self.pos, self.var_ref, self.var_alt = kind, pos, ref, alt
 
 	def classify(self):
 		"""
-		:return: 'snp', 'mnp', 'ins', 'del' or 'complex'
+		:return: 'snp', 'mnp', 'ins', 'del', 'complex' or 'none'
 		"""
 		return self.kind
 
@@ -165,7 +170,7 @@ class GenomicPosition:
 			except KeyError:  # no CB tag
 				return False
 
-		if self.kind in ('ins', 'del'):
+		if self.kind in ('ins', 'del', 'complex'):
 			ref = RefWindow(fasta, self.chrm, self.pos - 1, self.pos + len(self.var_ref))
 			reads = self.indel_reads(pile, ref, keep)
 		else:
@@ -247,7 +252,8 @@ class GenomicPosition:
 		"""
 		:param ref: RefWindow around the variant
 		:param keep: function, False for reads to skip before checking their allele
-		:return: generator of (alignment, 'ref' or 'alt') for an insertion/deletion
+		:return: generator of (alignment, 'ref' or 'alt') for an insertion,
+		 deletion or complex variant
 
 		Indel could be in a repeat, so we get all positions that it could be
 		found by left- and right-aligning it. If the CIGAR is clean (across the site
@@ -256,18 +262,34 @@ class GenomicPosition:
 		ending near it, mismatches or other indels near it) are then realigned to
 		the ref and alt haplotypes to see which matches better (see Haplotypes).
 		Reads that fit neither clearly better are not included in the counts.
+
+		A complex variant (unequal-length substitution, eg ACCT/GCGGGAAA) can
+		be aligned many ways: as mismatches plus an insertion or deletion, as
+		a deletion plus an insertion, or soft-clipped, and the indels can be
+		moved into repeats either side of it. So only reference reads are
+		called from the CIGAR, if they match the reference across all the
+		bases an alt read could be shifted over (see complex_span()), and
+		every other read nearby is realigned.
 		"""
-		p, seq, ref_len = self.indel_event()
-		variant = left_align(p, seq, ref) + (ref_len,)
-		right = right_align(p, seq, ref_len, ref)[0]
-		lo, hi = variant[0] - 1, right + ref_len  # ref bases flanking the repeat
-		haps = Haplotypes(ref, variant, lo, hi)
+		if self.kind == 'complex':
+			p, seq, ref_len = self.pos - 1, self.var_alt, len(self.var_ref)
+			variant = (p, seq, ref_len)
+			lo, hi = complex_span(p, ref_len, seq, ref)
+			haps = Haplotypes(ref, p, ref_len, seq, lo, hi)
+		else:
+			p, seq, ref_len = self.indel_event()
+			variant = left_align(p, seq, ref) + (ref_len,)
+			right = right_align(p, seq, ref_len, ref)[0]
+			lo, hi = variant[0] - 1, right + ref_len  # ref bases flanking the repeat
+			haps = Haplotypes(ref, variant[0], ref_len, '' if ref_len else variant[1], lo, hi)
 		# a read aligned just short of the repeat can still reach it with a soft clip
 		reach = len(seq) + FLANK
 		for aln in pile.fetch(self.chrm, max(0, lo - reach), hi + reach + 1):
 			if not keep(aln):
 				continue
 			allele = indel_allele(aln, lo, hi, variant, ref)
+			if self.kind == 'complex' and allele != 'ref':
+				allele = REALIGN  # the CIGAR can only be trusted for ref reads
 			if allele is REALIGN:
 				allele = haps.allele(aln)
 			if allele:
@@ -454,6 +476,46 @@ def right_align(p, seq, ref_len, ref):
 	return p, seq
 
 
+def complex_span(p, n, seq, ref):
+	"""
+	the reference bases a read must match, with no indel, to be a ref read at
+	a complex variant. An aligner can write the alt as indels moved away from
+	the substitution, into repeats either side of it (eg T>GG at the last T of
+	TTTTGGGG as a T deleted at the start of the T run and GG inserted after
+	the G run), leaving the bases at the substitution looking like ref.
+	So the span is widened until its reference bases can't be found in the
+	alt haplotype nearby: then a read with them isn't an alt read, however
+	it's aligned. It's widened on both sides, then trimmed back on each.
+	:param p: 0-based first reference base replaced
+	:param n: number of reference bases replaced
+	:param seq: bases in their place
+	:param ref: RefWindow
+	:return: (lo, hi), 0-based first and last base of the span, at least the
+	 bases either side of the substitution. Stops at the RefWindow's edges
+	"""
+	# a read anchored outside the repeats is shifted against the alt by at
+	# most the event size: copies of the span further away don't count
+	slack = n + len(seq) + FLANK
+
+	def in_alt(lo, hi):
+		lo = max(lo, ref.start)  # p is the first base of the contig
+		a, b = max(ref.start, lo - slack), min(ref.end, hi + 1 + slack)
+		alt = ref.bases(a, p - a) + seq + ref.bases(p + n, b - p - n)
+		return ref.bases(lo, hi + 1 - lo) in alt
+
+	lo, hi = p - 1, p + n
+	while in_alt(lo, hi) and (lo > ref.start or hi < ref.end - 1):
+		if lo > ref.start:
+			lo -= 1
+		if hi < ref.end - 1:
+			hi += 1
+	while lo < p - 1 and not in_alt(lo + 1, hi):
+		lo += 1
+	while hi > p + n and not in_alt(lo, hi - 1):
+		hi -= 1
+	return lo, hi
+
+
 # CIGAR op codes, as pysam gives them in cigartuples
 CMATCH, CINS, CDEL, CREF_SKIP, CSOFT_CLIP, CHARD_CLIP, CPAD, CEQUAL, CDIFF = range(9)
 ALIGNED_OPS = (CMATCH, CEQUAL, CDIFF)  # M = X: a read base on a reference base
@@ -580,21 +642,25 @@ def local_score(q, t):
 
 class Haplotypes:
 	"""
-	ref and alt sequence around an indel, to realign reads whose CIGAR
-	can't be trusted (see indel_allele())
+	ref and alt sequence around an indel or complex variant, to realign
+	reads whose CIGAR can't be trusted (see indel_allele())
 	"""
-        
-	def __init__(self, ref, variant, lo, hi):
+
+	def __init__(self, ref, p, n, ins, lo, hi):
 		"""
+		the alt haplotype replaces the n reference bases from p with ins
 		:param ref: RefWindow
-		:param variant: left-aligned (p, seq, ref_len) of the variant
-		:param lo, hi: 0-based reference bases flanking the repeat the indel is in
+		:param p: 0-based first reference base the variant affects (for an
+		 indel, left-aligned as in left_align())
+		:param n: number of reference bases replaced (0 for an insertion)
+		:param ins: bases in their place ('' for a deletion)
+		:param lo, hi: 0-based reference bases flanking the repeat the variant is in
 		"""
-		self.p, seq, self.n = variant
+		self.p, self.n, self.ins = p, n, ins
 		self.lo, self.hi = lo, hi
-		self.ins = '' if self.n else seq
-		self.trim = len(seq) + 20  # query bases kept either side of the repeat
-		self.band = len(seq) + 10  # extra reference bases either side of them
+		size = max(n, len(ins))
+		self.trim = size + 20  # query bases kept either side of the repeat
+		self.band = size + 10  # extra reference bases either side of them
 		pad = self.trim + self.band + 10
 		self.start = max(ref.start, lo - pad)
 		self.end = min(ref.end, hi + 1 + pad)
@@ -1211,9 +1277,9 @@ if __name__ == '__main__':
 
 		for x in variant_list:
 			print(x.chrm, x.start, x.event, x.gene, x.classify())
-			if x.kind == 'complex':
-				warn("skipping unsupported variant (ref and alt differ in length "
-					 "after trimming shared bases): {}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
+			if x.kind == 'none':
+				warn("skipping variant with the same ref and alt: "
+					 "{}\t{}\t{}\t{}".format(x.chrm, x.start, x.ref, x.alt))
 				continue
 			barcode_counts = x.count_barcodes(bam, bars, mq, bq, fasta, args.atac)
 			# print(check_classify[0])

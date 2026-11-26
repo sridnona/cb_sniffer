@@ -28,7 +28,7 @@ BARCODES = os.path.join(TEST_DIR, 'barcodes.tsv')
 
 sys.path.insert(0, REPO_DIR)
 from cb_sniffer import (GenomicPosition, is_vcf, read_variants, left_align, right_align,  # noqa: E402
-						local_score, Haplotypes, RefWindow)
+						local_score, Haplotypes, RefWindow, complex_span)
 
 DEL, INS, SNV, SNV_MQ, NOCOV, MNP = 12904213, 13562395, 13625741, 15268954, 10000001, 10066353
 # start position of each site in variants_vcf.tsv -> the same site in variants.tsv
@@ -100,9 +100,13 @@ def default_run(tmp_path_factory):
 	('ACCCC', 'ACCC', 'del', 101, 'C', ''),     # padding across a repeat is trimmed
 	('GACT', 'GA', 'del', 102, 'CT', ''),       # more than one shared leading base
 	('CA', 'A', 'del', 100, 'C', ''),           # no anchor base
-	# not supported
+	# complex: unequal-length substitution
 	('ATC', 'GG', 'complex', 100, 'ATC', 'GG'),
-	('A', 'A', 'complex', 100, '', ''),
+	('ACCT', 'GCGGGAAA', 'complex', 100, 'ACCT', 'GCGGGAAA'),
+	('ACCT', 'ACGGGAAT', 'complex', 102, 'C', 'GGGAA'),  # anchor, shared ends trimmed
+	('ACT', 'AGGT', 'complex', 101, 'C', 'GG'),
+	# nothing to count
+	('A', 'A', 'none', 100, '', ''),
 ])
 def test_normalize(ref, alt, kind, pos, var_ref, var_alt):
 	v = variant(ref, alt)
@@ -604,12 +608,15 @@ def test_haplotypes():
 	ref = RefWindow.__new__(RefWindow)
 	ref.start, ref.seq = 0, 'ACGTACGTAC' * 20
 	ref.end = len(ref.seq)
-	h = Haplotypes(ref, (100, 'TT', 0), 99, 100)   # TT inserted before base 100
+	h = Haplotypes(ref, 100, 0, 'TT', 99, 100)   # TT inserted before base 100
 	assert h.alt == h.ref[:100 - h.start] + 'TT' + h.ref[100 - h.start:]
 	assert h.alt_index(99) == 99 - h.start and h.alt_index(100) == 102 - h.start
-	h = Haplotypes(ref, (100, 'AC', 2), 99, 102)   # 100-101 deleted
+	h = Haplotypes(ref, 100, 2, '', 99, 102)   # 100-101 deleted
 	assert h.alt == h.ref[:100 - h.start] + h.ref[102 - h.start:]
 	assert h.alt_index(101) == 100 - h.start and h.alt_index(102) == 100 - h.start
+	h = Haplotypes(ref, 100, 2, 'GGGAA', 99, 102)   # 100-101 replaced by GGGAA
+	assert h.alt == h.ref[:100 - h.start] + 'GGGAA' + h.ref[102 - h.start:]
+	assert h.alt_index(99) == 99 - h.start and h.alt_index(102) == 105 - h.start
 
 
 def test_reference_missing_chromosome_dies(tmp_path):
@@ -655,16 +662,90 @@ def test_vcf_style_matches_dash(tmp_path, default_run):
 		assert [got[c] for c in cols] == [want[c] for c in cols], vcf_site
 
 
-def test_complex_variant_is_skipped(tmp_path):
+def test_same_ref_alt_is_skipped(tmp_path):
 	variants = tmp_path / 'variants.tsv'
 	lines = open(VARIANTS).read().splitlines()
-	lines.insert(2, '1\t13625741\t13625743\tTGC\tCA\tLactb2\tcomplex')
+	lines.insert(2, '1\t13625741\t13625741\tT\tT\tLactb2\tnone')
 	variants.write_text('\n'.join(lines) + '\n')
 	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
-	assert 'skipping unsupported variant' in result.stderr
+	assert 'skipping variant with the same ref and alt' in result.stderr
 	rows = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))
 	assert [int(r['start']) for r in rows] == [DEL, INS, SNV, SNV_MQ, NOCOV, MNP]
+
+
+# complex variant: 1-based 101-104 ACCT replaced by GCGGGAAA
+CPX_REF = random_ref(7, {99: 'T', 100: 'ACCT', 104: 'C'})
+CPX_ALT = CPX_REF[:100] + 'GCGGGAAA' + CPX_REF[104:]
+CPX_LINE = '1\t101\t104\tACCT\tGCGGGAAA\tg\tcomplex'
+
+
+def test_complex_variant(tmp_path):
+	"""an unequal-length substitution is alt however the aligner wrote it"""
+	row = run_synthetic(tmp_path, [
+		('20M4I24M', CPX_ALT[80:128]),     # mismatches plus an insertion: alt
+		('20M8I4D20M', CPX_ALT[80:128]),   # insertion next to a deletion: alt
+		('20M28S', CPX_ALT[80:128]),       # soft-clipped at the substitution: alt
+		('40M', CPX_ALT[80:120]),          # all mismatches: alt
+		('48M', CPX_REF[80:128]),          # ref
+		('22M', CPX_REF[80:102]),          # ends inside the substitution: not counted
+	], CPX_LINE, CPX_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('5', '4')
+	assert row['CB_barcodes'] == 'CELL0-1,CELL1-1,CELL2-1,CELL3-1'
+
+
+def test_complex_variant_other_alleles_not_alt(tmp_path):
+	"""reads with a different, simpler change at the same place aren't alt"""
+	ins_only = CPX_REF[:104] + 'GGGA' + CPX_REF[104:]   # bases inserted, ACCT kept
+	row = run_synthetic(tmp_path, [
+		('22M2D24M', CPX_REF[80:102] + CPX_REF[104:128]),   # CC deleted
+		('48M', CPX_REF[80:100] + 'G' + CPX_REF[101:128]),  # SNV A>G
+		('24M4I20M', ins_only[80:128]),                     # insertion only
+		('20M4I24M', CPX_ALT[80:128]),                      # alt
+	], CPX_LINE, CPX_REF)
+	assert row['UB_ALT'] == '1' and row['CB_barcodes'] == 'CELL3-1'
+
+
+# complex variant at a repeat boundary: 1-based 100, the last T of 91-100 TTTTTTTTTT,
+# replaced by GG, before 101-110 GGGGGGGGGG
+RPT_REF = random_ref(3, {80: 'C' + 'A' * 9 + 'T' * 10 + 'G' * 10 + 'C'})
+RPT_ALT = RPT_REF[:99] + 'GG' + RPT_REF[100:]
+RPT_LINE = '1\t100\t100\tT\tGG\tg\tcomplex'
+
+
+@pytest.mark.parametrize('cigar', [
+	'10M1D19M2I19M',  # T deleted at the start of the T run, GG inserted after the G run
+	'19M1D10M2I19M',  # T deleted at the end of the T run, GG inserted after the G run
+	'19M1X10M1I19M',  # last T>G, one G inserted after the G run
+])
+def test_complex_variant_shifted_into_repeats(tmp_path, cigar):
+	"""an alt read whose aligner moved the change away from the substitution,
+	into the repeats either side of it, is still alt; a ref read is ref"""
+	row = run_synthetic(tmp_path, [(cigar, RPT_ALT[80:130]), ('50M', RPT_REF[80:130])],
+						RPT_LINE, RPT_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL0-1')
+
+
+@pytest.mark.parametrize('refseq, p, n, seq, expected', [
+	(CPX_REF, 100, 4, 'GCGGGAAA', (99, 104)),  # no repeat: just the bases either side
+	(RPT_REF, 99, 1, 'GG', (90, 100)),   # last T: all of the T run, which the alt shortens
+	(RPT_REF, 90, 1, 'AA', (89, 99)),    # first T: all of the T run, after the A run
+	(RPT_REF, 90, 1, 'CC', (89, 91)),    # first T, alt matches neither run
+])
+def test_complex_span(refseq, p, n, seq, expected):
+	ref = RefWindow.__new__(RefWindow)
+	ref.start, ref.seq, ref.end = 0, refseq, len(refseq)
+	assert complex_span(p, n, seq, ref) == expected
+
+
+def test_complex_variant_real_data(tmp_path):
+	"""a complex variant at the Lactb2 SNV (T>C), which no read has"""
+	variants = tmp_path / 'variants.tsv'
+	variants.write_text('1\t13625741\t13625743\tTAG\tCA\tLactb2\tcomplex\n')
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
+	subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
+	row = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))[0]
+	assert row['type'] == 'complex' and int(row['UB_DEPTH']) > 0 and row['UB_ALT'] == '0'
 
 
 def run_expecting_error(tmp_path, text):
