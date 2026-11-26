@@ -624,7 +624,58 @@ def test_reference_missing_chromosome_dies(tmp_path):
 	cmd = [sys.executable, SCRIPT, '-r', 'ref.fa', BAM, VARIANTS, BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
 	assert result.returncode == 1
-	assert 'no sequence for chromosome(s) 1' in result.stderr
+	assert 'ref.fa: no chromosome(s) 1' in result.stderr
+	assert 'naming conventions' not in result.stderr
+
+
+def run_on_chroms(tmp_path, chroms, bam=BAM):
+	"""
+	run with one SNV at position 2 on each chromosome in chroms, and a
+	reference that has all of them
+	"""
+	(tmp_path / 'ref.fa').write_text(''.join('>{}\nACGTACGT\n'.format(c) for c in chroms))
+	(tmp_path / 'v.tsv').write_text(''.join('{}\t2\t2\tC\tT\tg\tsnp\n'.format(c) for c in chroms))
+	cmd = [sys.executable, SCRIPT, '-r', 'ref.fa', bam, 'v.tsv', BARCODES, 'out']
+	return subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+
+
+def test_bam_missing_chromosome_dies(tmp_path):
+	"""a chromosome in the reference but not the BAM stops the run before any
+	output, rather than partway through it"""
+	result = run_on_chroms(tmp_path, ['1', 'contigZ', 'contigY'])
+	assert result.returncode == 1
+	assert result.stderr.strip() == 'ERROR: {}: no chromosome(s) contigY, contigZ'.format(BAM)
+	assert not list(tmp_path.glob('out_*.tsv'))
+
+
+@pytest.mark.parametrize('chroms, hint', [
+	(['chr1'], 'chr1 vs 1'),
+	(['chrX', 'chrM', 'contigZ'], 'chrM vs MT, chrX vs X'),
+])
+def test_bam_missing_chromosome_naming_hint(tmp_path, chroms, hint):
+	"""the error suggests the BAM names chromosomes differently, when it does"""
+	result = run_on_chroms(tmp_path, chroms)
+	assert result.returncode == 1
+	assert ('Are the naming conventions different between the variants and '
+			'test.bam ({})?'.format(hint)) in result.stderr
+	assert not list(tmp_path.glob('out_*.tsv'))
+
+
+def test_reference_missing_chromosome_naming_hint(tmp_path):
+	(tmp_path / 'ref.fa').write_text('>chr1\nACGT\n')
+	cmd = [sys.executable, SCRIPT, '-r', 'ref.fa', BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+	assert result.returncode == 1
+	assert 'ref.fa: no chromosome(s) 1. Are the naming conventions different' in result.stderr
+	assert '(1 vs chr1)' in result.stderr
+
+
+@pytest.mark.parametrize('name, alias', [
+	('chr1', '1'), ('1', 'chr1'), ('chrX', 'X'), ('X', 'chrX'), ('chrM', 'MT'), ('MT', 'chrM'),
+])
+def test_chrom_alias(name, alias):
+	from cb_sniffer import chrom_alias
+	assert chrom_alias(name) == alias
 
 
 def test_deletion_reference_mismatch_warns(tmp_path):

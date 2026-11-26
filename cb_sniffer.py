@@ -1,6 +1,7 @@
 from collections import Counter, defaultdict
 import gzip
 import itertools
+import os
 import pysam
 import logging as logger
 import sys
@@ -1074,10 +1075,7 @@ def has_umis(bam, variants, bar, sample=1000):
 	 no reads with a good CB barcode were found
 	"""
 	seen = 0
-	refs = set(bam.references)
 	for x in variants:
-		if x.chrm not in refs:
-			continue  # reported when the variant is counted
 		for aln in bam.fetch(x.chrm, max(0, x.pos - 1), x.pos + 1):
 			if not aln.has_tag('CB') or aln.get_tag('CB') not in bar:
 				continue
@@ -1112,6 +1110,37 @@ def die(msg):
 	logger.error(msg)
 	print('ERROR: ' + msg, file=sys.stderr)
 	sys.exit(1)
+
+
+def chrom_alias(name):
+	""":return: the name under the other naming convention: 'chr1' <-> '1', 'chrM' <-> 'MT'"""
+	if name == 'chrM':
+		return 'MT'
+	if name == 'MT':
+		return 'chrM'
+	return name[3:] if name.startswith('chr') else 'chr' + name
+
+
+def missing_chroms(variants, references, path):
+	"""
+	:param variants: list of GenomicPosition
+	:param references: chromosome names in a BAM/CRAM header or FASTA index
+	:param path: the BAM/CRAM or FASTA, for the message
+	:return: a message naming the variants' chromosomes that aren't in
+	 references, with a hint if they're there under the other naming convention
+	 (chr1 vs 1), or None if they're all there
+	"""
+	references = set(references)
+	missing = sorted({x.chrm for x in variants} - references)
+	if not missing:
+		return None
+	msg = "{}: no chromosome(s) {}".format(path, ', '.join(missing))
+	renamed = ['{} vs {}'.format(c, chrom_alias(c)) for c in missing
+			   if chrom_alias(c) in references]
+	if renamed:
+		msg += (". Are the naming conventions different between the variants "
+				"and {} ({})?".format(os.path.basename(path), ', '.join(renamed)))
+	return msg
 
 
 def is_cram(path):
@@ -1239,9 +1268,9 @@ if __name__ == '__main__':
 	variant_list = list(read_variants(variants, args.pass_only))
 	logger.info("Number of variants:\t{}".format(len(variant_list)))
 	fasta = pysam.FastaFile(args.reference)
-	missing = sorted({x.chrm for x in variant_list} - set(fasta.references))
+	missing = missing_chroms(variant_list, fasta.references, args.reference)
 	if missing:
-		die("{}: no sequence for chromosome(s) {}".format(args.reference, ', '.join(missing)))
+		die(missing)
 	for x in variant_list:
 		check_ref_allele(x, fasta)
 
@@ -1249,6 +1278,10 @@ if __name__ == '__main__':
 	logger.info("Number of good barcodes:\t{}".format(len(bars)))
 	bam = pysam.AlignmentFile(bam_file, 'rc' if cram else 'rb',  # opened once for all variants
 							  reference_filename=args.reference if cram else None)
+	# checked up front, so a bad chromosome can't stop the run partway through
+	missing = missing_chroms(variant_list, bam.references, bam_file)
+	if missing:
+		die(missing)
 	umis = has_umis(bam, variant_list, bars)
 	if umis is False and not args.atac:
 		die("{}: none of the reads with a listed CB barcode have a UB (UMI) tag. "
