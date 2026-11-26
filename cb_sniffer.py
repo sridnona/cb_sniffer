@@ -147,8 +147,8 @@ class GenomicPosition:
 		:param baseq: base quality (snp/mnp only)
 		:param fasta: pysam.FastaFile, used to left-align indels and realign reads at them
 		:param atac: scATAC mode: there are no UMIs, so each fragment (read
-		 name) stands in for a UMI, and secondary, QC-fail and duplicate
-		 reads are skipped
+		 name) stands in for a UMI, and secondary and duplicate reads are
+		 skipped as well as QC-fail ones (which are skipped in either mode)
 		:return: two dicts 1) CB:UB barcodes of all counted reads, by read name
 		2) dict with ref and alt CB:UB barcodes (CB:read name in atac mode)
 		"""
@@ -162,7 +162,7 @@ class GenomicPosition:
 			# cheap filters - remove reads before spending the time to look at the allele
 			if aln.mapping_quality < mapq:
 				return False
-			if atac and aln.flag & ATAC_SKIP_FLAGS:
+			if aln.flag & (ATAC_SKIP_FLAGS if atac else QC_FAIL):
 				return False
 			try:
 				# only look at known good barcodes
@@ -1040,8 +1040,10 @@ def _full_qual(aln, i):
 	return 255 if quals is None else quals[i]
 
 
+# reads that failed platform/vendor quality checks, skipped in every mode
+QC_FAIL = 0x200
 # reads skipped in atac mode: secondary, QC fail, duplicate
-ATAC_SKIP_FLAGS = 0x100 | 0x200 | 0x400
+ATAC_SKIP_FLAGS = 0x100 | QC_FAIL | 0x400
 
 
 def read_once(calls):

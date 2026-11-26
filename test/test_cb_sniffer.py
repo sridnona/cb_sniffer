@@ -1113,6 +1113,28 @@ def test_atac_deletion_counts_fragments(tmp_path):
 	assert rows[0]['CB:UB_barcodes'] == 'CELL1-1:fragA'
 
 
+def with_umi(read, ub):
+	"""a read from atac_read() or atac_del_read(), given a UB tag"""
+	return read[:5] + (ub,)
+
+
+@pytest.mark.parametrize('kind', ['snv', 'deletion'])
+def test_qcfail_skipped_without_atac(tmp_path, kind):
+	"""QC-fail reads are skipped in scRNA mode too"""
+	if kind == 'snv':
+		alt, qc, ref = (atac_read('r1', 'CELL1-1', True), atac_read('qc', 'CELL2-1', True, 0x200),
+						atac_read('r3', 'CELL2-1', False))
+		line, refseq = '1\t100\t100\tA\tC\tg\tsnp', 'A' * 1000
+	else:
+		alt, qc, ref = (atac_del_read('r1', 'CELL1-1', 0, True), atac_del_read('qc', 'CELL2-1', 0x200, True),
+						atac_del_read('r3', 'CELL2-1', 0, False))
+		line, refseq = '1\t100\t100\tA\t-\tg\tdeletion', ATAC_DEL_REF
+	reads = [with_umi(alt, 'U1'), with_umi(qc, 'U2'), with_umi(ref, 'U3')]  # QC-fail alt read skipped
+	result, rows = run_atac(tmp_path, reads, line, opts=(), refseq=refseq)
+	assert result.returncode == 0, result.stderr
+	assert (rows[0]['UB_DEPTH'], rows[0]['UB_ALT'], rows[0]['CB_barcodes']) == ('2', '1', 'CELL1-1')
+
+
 def test_atac_with_umis_warns(tmp_path, default_run):
 	"""--atac on a scRNA BAM warns; every read with a CB is counted as its own fragment"""
 	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, '--atac', BAM, VARIANTS, BARCODES, 'out']
