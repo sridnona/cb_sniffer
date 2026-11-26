@@ -454,6 +454,13 @@ def right_align(p, seq, ref_len, ref):
 	return p, seq
 
 
+# CIGAR op codes, as pysam gives them in cigartuples
+CMATCH, CINS, CDEL, CREF_SKIP, CSOFT_CLIP, CHARD_CLIP, CPAD, CEQUAL, CDIFF = range(9)
+ALIGNED_OPS = (CMATCH, CEQUAL, CDIFF)  # M = X: a read base on a reference base
+QUERY_ONLY_OPS = (CINS, CSOFT_CLIP)  # I S: read bases only
+REF_ONLY_OPS = (CDEL, CREF_SKIP)  # D N: reference bases only
+NO_STEP_OPS = (CHARD_CLIP, CPAD)  # H P: neither
+
 # a read's CIGAR is trusted at an indel only if it's aligned, with no clip,
 # splice or mismatch, across the repeat, and this many bases further on any
 # side where the alignment stops at a clip or splice
@@ -493,31 +500,31 @@ def indel_allele(aln, lo, hi, variant, ref):
 	clean = True
 	events = []
 	for op, n in aln.cigartuples:
-		if op in (0, 2, 7, 8) and run is None:
+		if (op in ALIGNED_OPS or op == CDEL) and run is None:
 			run = [r, cut]
-		if op in (0, 7, 8):  # M = X
+		if op in ALIGNED_OPS:
 			for i in range(max(r, a), min(r + n, b + 1)):
 				if query[q + i - r] != ref.base(i):
 					clean = False
 			r += n
 			q += n
-		elif op == 1:  # I
+		elif op == CINS:
 			if a < r <= b:
 				events.append((r, query[q:q + n], 0))
 			q += n
-		elif op == 2:  # D
+		elif op == CDEL:
 			if r <= b and r + n > a:
 				events.append((r, ref.bases(r, n), n))
 			r += n
-		elif op in (3, 4, 5):  # N S H
-			if op == 3 and r <= hi and r + n > lo:
+		elif op in (CREF_SKIP, CSOFT_CLIP, CHARD_CLIP):
+			if op == CREF_SKIP and r <= hi and r + n > lo:
 				return None  # spliced across the repeat
 			if run is not None:
 				runs.append((run[0], r, run[1], True))
 			run, cut = None, True
-			if op == 3:
+			if op == CREF_SKIP:
 				r += n
-			elif op == 4:
+			elif op == CSOFT_CLIP:
 				q += n
 	if run is not None:
 		runs.append((run[0], r, run[1], False))
@@ -620,20 +627,20 @@ class Haplotypes:
 		r, q = aln.reference_start, 0
 		aligned = False
 		for op, n in aln.cigartuples:
-			if op in (0, 7, 8):  # M = X
+			if op in ALIGNED_OPS:
 				segments[-1].extend((q + i, r + i) for i in range(n))
 				r += n
 				q += n
 				aligned = True
-			elif op == 1:  # I
+			elif op == CINS:
 				segments[-1].extend((q + i, r) for i in range(n))
 				q += n
-			elif op == 2:  # D
+			elif op == CDEL:
 				r += n
-			elif op == 3:  # N
+			elif op == CREF_SKIP:
 				segments.append([])
 				r += n
-			elif op == 4:  # S
+			elif op == CSOFT_CLIP:
 				start = r if aligned else r - n
 				segments[-1].extend((q + i, start + i) for i in range(n))
 				q += n
@@ -667,15 +674,15 @@ def site_index(aln, p0, n):
 	end = p0 + n
 	rpos, qpos = aln.reference_start, 0
 	for op, length in aln.cigartuples:
-		if op == 0 or op == 7 or op == 8:  # M = X
+		if op in ALIGNED_OPS:
 			if rpos + length > p0:
 				for r in range(max(rpos, p0), min(rpos + length, end)):
 					out[r - p0] = qpos + r - rpos
 			rpos += length
 			qpos += length
-		elif op == 1 or op == 4:  # I S
+		elif op in QUERY_ONLY_OPS:
 			qpos += length
-		elif op == 2 or op == 3:  # D N
+		elif op in REF_ONLY_OPS:
 			rpos += length
 		if rpos >= end:  # past the variant; the rest of the CIGAR can't matter
 			break
@@ -717,7 +724,7 @@ class _CigarCursor:
 		cigar = self.cigar
 		while self.ci < len(cigar):
 			op, n = cigar[self.ci]
-			if op in (0, 7, 8):
+			if op in ALIGNED_OPS:
 				pos -= n
 				if pos < 0:
 					self.icig = n + pos
@@ -726,12 +733,12 @@ class _CigarCursor:
 					return 0
 				self.iseq += n
 				self.iref += n
-			elif op in (1, 4):
+			elif op in QUERY_ONLY_OPS:
 				self.iseq += n
-			elif op in (2, 3):
+			elif op in REF_ONLY_OPS:
 				pos = max(pos - n, 0)
 				self.iref += n
-			elif op not in (5, 6):
+			elif op not in NO_STEP_OPS:
 				return -2
 			self.ci += 1
 			self.icig = 0
@@ -743,17 +750,17 @@ class _CigarCursor:
 		cigar = self.cigar
 		while self.ci < len(cigar):
 			op, n = cigar[self.ci]
-			if op in (0, 7, 8):
+			if op in ALIGNED_OPS:
 				if self.icig < n - 1:
 					self.iseq += 1
 					self.icig += 1
 					self.iref += 1
 					return 0
-			elif op in (2, 3):
+			elif op in REF_ONLY_OPS:
 				self.iref += n
-			elif op in (1, 4):
+			elif op in QUERY_ONLY_OPS:
 				self.iseq += n
-			elif op not in (5, 6):
+			elif op not in NO_STEP_OPS:
 				return -2
 			self.ci += 1
 			self.icig = -1
@@ -762,7 +769,7 @@ class _CigarCursor:
 
 	def after_deletion(self):
 		"""did the cursor just step over a deletion (htslib's catch-up check)"""
-		return self.ci > 0 and self.cigar[self.ci - 1][0] == 2
+		return self.ci > 0 and self.cigar[self.ci - 1][0] == CDEL
 
 
 class MateOverlap:
@@ -858,11 +865,11 @@ class MateOverlap:
 		for op, length in cigar:
 			if rpos > hi:
 				return False
-			if op == 2 or op == 3:
+			if op in REF_ONLY_OPS:
 				if rpos + length > lo:
 					return True
 				rpos += length
-			elif op == 0 or op == 7 or op == 8:
+			elif op in ALIGNED_OPS:
 				rpos += length
 		return False
 
