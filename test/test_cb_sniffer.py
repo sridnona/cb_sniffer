@@ -758,3 +758,233 @@ def test_pass_only_option(tmp_path):
 	rows = run(tmp_path, '--pass-only', variants=VCF)['AllCounts']
 	assert len(rows) == 6
 	assert 15268954 not in [int(r['start']) for r in rows]
+
+
+# --- scATAC (--atac) -----------------------------------------------------------
+
+def atac_read(name, cell, alt=False, flag=0, cigar='40M', ub=None):
+	"""
+	(name, cell, cigar, sequence, flag, ub) for write_atac_bam(): a 40-base read
+	starting at 81 on contig 1, all A except base 100 (C when alt).
+	For cigar 19M1D20M the sequence is all A (base 100 deleted).
+	"""
+	if 'D' in cigar:
+		seq = 'A' * 39
+	else:
+		seq = 'A' * 19 + ('C' if alt else 'A') + 'A' * 20
+	return name, cell, cigar, seq, flag, ub
+
+
+def mates(name, cell, alt1=False, alt2=False, cigar='40M'):
+	"""both reads of a pair, overlapping over their whole length"""
+	return [atac_read(name, cell, alt1, 0x1 | 0x2 | 0x40, cigar),
+			atac_read(name, cell, alt2, 0x1 | 0x2 | 0x80, cigar)]
+
+
+def write_atac_bam(tmp_path, reads, cells=('CELL1-1', 'CELL2-1', 'CELL3-1')):
+	"""write reads (see atac_read()) to an indexed BAM, plus a barcode file"""
+	import pysam
+	bam = str(tmp_path / 'atac.bam')
+	header = {'HD': {'VN': '1.6', 'SO': 'coordinate'}, 'SQ': [{'SN': '1', 'LN': 1000}]}
+	with pysam.AlignmentFile(bam, 'wb', header=header) as out:
+		for name, cell, cigar, seq, flag, ub in reads:
+			a = pysam.AlignedSegment()
+			a.query_name, a.cigarstring, a.query_sequence, a.flag = name, cigar, seq, flag
+			a.reference_id, a.reference_start, a.mapping_quality = 0, 80, 60
+			if flag & 0x1:
+				a.next_reference_id, a.next_reference_start = 0, 80
+			a.query_qualities = pysam.qualitystring_to_array('F' * len(seq))
+			tags = [('CB', cell)] + ([('UB', ub)] if ub else [])
+			a.set_tags(tags)
+			out.write(a)
+	pysam.index(bam)
+	(tmp_path / 'bc.tsv').write_text(''.join(c + '\n' for c in cells))
+	return bam
+
+
+def run_atac(tmp_path, reads, variant_line='1\t100\t100\tA\tC\tg\tsnp', opts=('--atac',)):
+	"""run on a synthetic ATAC BAM; return (CompletedProcess, AllCounts rows or None)"""
+	bam = write_atac_bam(tmp_path, reads)
+	(tmp_path / 'v.tsv').write_text(variant_line + '\n')
+	result = subprocess.run([sys.executable, SCRIPT, *opts, bam, 'v.tsv', 'bc.tsv', 'out'],
+							cwd=str(tmp_path), capture_output=True, text=True)
+	out = tmp_path / 'out_AllCounts.tsv'
+	return result, read_tsv(str(out)) if out.exists() else None
+
+
+ATAC_SNV_READS = (
+	mates('fragA', 'CELL1-1', True, True)      # both mates alt: one alt fragment
+	+ [atac_read('fragB', 'CELL1-1', True)]    # unpaired alt read
+	+ mates('fragC', 'CELL2-1', False, False)  # both mates ref: one ref fragment
+	+ mates('fragD', 'CELL2-1', False, True)   # mates disagree: dropped
+	+ [atac_read('dup', 'CELL3-1', True, 0x400),     # duplicate: skipped
+	   atac_read('supp', 'CELL3-1', True, 0x800),    # supplementary: skipped
+	   atac_read('sec', 'CELL3-1', True, 0x100),     # secondary: skipped
+	   atac_read('qcfail', 'CELL3-1', True, 0x200)]  # QC fail: skipped
+)
+
+
+def test_no_umis_without_atac_dies(tmp_path):
+	"""issue #17: an ATAC BAM used to give empty output with no error"""
+	result, rows = run_atac(tmp_path, ATAC_SNV_READS, opts=())
+	assert result.returncode == 1
+	assert 'have a UB (UMI) tag' in result.stderr and '--atac' in result.stderr
+	assert rows is None and not list(tmp_path.glob('out_*.tsv'))
+
+
+def test_atac_counts_fragments(tmp_path):
+	result, rows = run_atac(tmp_path, ATAC_SNV_READS)
+	assert result.returncode == 0, result.stderr
+	row = rows[0]
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['UB_VAF']) == ('3', '2', '0.67')
+	assert row['CB_barcodes'] == 'CELL1-1'
+	assert row['CB:UB_barcodes'] == 'CELL1-1:fragA,CELL1-1:fragB'
+	ub = read_tsv(str(tmp_path / 'out_counts_UB.tsv'))
+	# read counts per fragment: both mates are counted, the fragment once;
+	# fragD (mates disagree) fails consensus and is left out, like a discordant UMI
+	assert {r['barcode']: (r['ref_count'], r['alt_count']) for r in ub} == {
+		'CELL1-1:fragA': ('0', '2'), 'CELL1-1:fragB': ('0', '1'),
+		'CELL2-1:fragC': ('2', '0')}
+	cb = read_tsv(str(tmp_path / 'out_counts_CB.tsv'))
+	assert {r['barcode']: (r['ref_count'], r['alt_count']) for r in cb} == {
+		'CELL1-1': ('0', '2'), 'CELL2-1': ('1', '0')}
+
+
+def test_atac_deletion_counts_fragments(tmp_path):
+	reads = (mates('fragA', 'CELL1-1', cigar='19M1D20M')    # both mates carry the deletion
+			 + mates('fragB', 'CELL2-1')                     # ref
+			 + [atac_read('dup', 'CELL3-1', flag=0x400, cigar='19M1D20M')])
+	result, rows = run_atac(tmp_path, reads, '1\t100\t100\tA\t-\tg\tdeletion')
+	assert result.returncode == 0, result.stderr
+	assert (rows[0]['UB_DEPTH'], rows[0]['UB_ALT']) == ('2', '1')
+	assert rows[0]['CB:UB_barcodes'] == 'CELL1-1:fragA'
+
+
+def test_atac_with_umis_warns(tmp_path, default_run):
+	"""--atac on a scRNA BAM warns; every read with a CB is counted as its own fragment"""
+	cmd = [sys.executable, SCRIPT, '--atac', BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
+	assert '--atac given, but reads have UB (UMI) tags' in result.stderr
+
+
+def test_rna_bam_passes_umi_check(tmp_path):
+	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
+	assert 'UB (UMI) tag' not in result.stderr
+
+
+# --- scATAC (--atac), real data ---------------------------------------------------
+# atac.bam is a subset of the 10x PBMC 5k NextGEM scATAC BAM (Cell Ranger ATAC,
+# GRCh38): reads overlapping the five sites in atac_variants.tsv. See README.md
+
+ATAC_BAM = os.path.join(TEST_DIR, 'atac.bam')
+ATAC_VARIANTS = os.path.join(TEST_DIR, 'atac_variants.tsv')
+ATAC_BARCODES = os.path.join(TEST_DIR, 'atac_barcodes.tsv')
+ATAC_REFERENCE = os.path.join(TEST_DIR, 'atac_reference.fa.gz')  # N except +-3 kb around the indels
+A_GAPDH, A_ACTB, A_HLAC, A_DEL, A_INS = 6534761, 5530212, 31271428, 6470901, 5532355
+# fragment GCTTGC...-1:...34820 at A_INS: mate 2 has the insertion; mate 1 is aligned one
+# base past it, then soft-clipped
+A_SOFTCLIP_FRAG = 'GCTTGCTCAATGCACT-1:A00519:269:H7FM2DRXX:1:2123:32353:34820'
+
+
+def run_real_atac(tmp_path, *opts, check=True):
+	"""run on atac.bam; return (CompletedProcess, output tables keyed by name, or None)"""
+	cmd = [sys.executable, SCRIPT, *opts, ATAC_BAM, ATAC_VARIANTS, ATAC_BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, check=check)
+	if not (tmp_path / 'out_AllCounts.tsv').exists():
+		return result, None
+	return result, {name: read_tsv(str(tmp_path / 'out_{}.tsv'.format(name)))
+					for name in ('AllCounts', 'counts_CB', 'counts_UB')}
+
+
+@pytest.fixture(scope='module')
+def atac_run(tmp_path_factory):
+	return run_real_atac(tmp_path_factory.mktemp('atac'), '--atac')
+
+
+def depth_alt(tables):
+	return {int(r['start']): (int(r['UB_DEPTH']), int(r['UB_ALT']))
+			for r in tables['AllCounts']}
+
+
+def ub_rows(tables, start):
+	return {r['barcode']: (int(r['ref_count']), int(r['alt_count']))
+			for r in tables['counts_UB'] if int(r['start']) == start}
+
+
+def test_real_atac_without_flag_dies(tmp_path):
+	result, tables = run_real_atac(tmp_path, check=False)
+	assert result.returncode == 1
+	assert 'rerun with --atac' in result.stderr
+	assert tables is None
+
+
+def test_real_atac_no_umi_warning(atac_run):
+	result, _ = atac_run
+	assert 'UB (UMI) tag' not in result.stderr
+
+
+# fragments (ref + alt) / alt fragments, checked against an independent pysam count
+# of distinct non-duplicate read names per allele with a listed CB
+REAL_ATAC_EXPECTED = {
+	(): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (320, 176),
+		 A_DEL: (449, 182), A_INS: (10, 2)},
+	# HLA-C has 46 alt fragments with MAPQ < 30
+	('-mq', '30'): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (274, 130),
+					A_DEL: (449, 182), A_INS: (10, 2)},
+	('-bq', '30'): {A_GAPDH: (228, 119), A_ACTB: (126, 62), A_HLAC: (298, 156),
+					A_DEL: (449, 182), A_INS: (10, 2)},
+	# the insertion can shift one base right, so with -r a ref read must reach one
+	# base further: soft-clipped reads that stop there are no longer ref (see
+	# test_real_atac_softclip_mates)
+	('-r', ATAC_REFERENCE): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (320, 176),
+							 A_DEL: (449, 182), A_INS: (5, 3)},
+}
+
+
+@pytest.mark.parametrize('opts', list(REAL_ATAC_EXPECTED), ids=lambda o: ' '.join(o) or 'default')
+def test_real_atac_counts(tmp_path, atac_run, opts):
+	tables = atac_run[1] if not opts else run_real_atac(tmp_path, '--atac', *opts)[1]
+	assert depth_alt(tables) == REAL_ATAC_EXPECTED[opts]
+
+
+def test_real_atac_one_count_per_fragment(atac_run):
+	"""barcodes are CB:read name, and each fragment is one count in UB_DEPTH"""
+	_, tables = atac_run
+	listed = {l.strip() for l in open(ATAC_BARCODES)}
+	for start, (depth, alt) in REAL_ATAC_EXPECTED[()].items():
+		ub = ub_rows(tables, start)
+		assert len(ub) == depth
+		assert sum(1 for r, a in ub.values() if a) == alt
+		for barcode in ub:
+			cb, name = barcode.split(':', 1)
+			assert cb in listed and name.startswith('A00519:')
+	# where mates overlap the site both are counted in the UB file, but the
+	# fragment is still one count
+	gapdh = ub_rows(tables, A_GAPDH)
+	assert sum(1 for r, a in gapdh.values() if r + a == 2) == 61
+	assert max(r + a for r, a in gapdh.values()) == 2
+
+
+def test_real_atac_skips_duplicates(atac_run):
+	"""Cell Ranger ATAC marks (not removes) duplicates; none of them may be counted"""
+	pysam = pytest.importorskip('pysam')
+	with pysam.AlignmentFile(ATAC_BAM) as bam:
+		dups = {r.get_tag('CB') + ':' + r.query_name for r in bam
+				if r.is_duplicate and r.has_tag('CB')}
+	assert len(dups) > 1000
+	_, tables = atac_run
+	counted = {r['barcode'] for r in tables['counts_UB']}
+	assert counted and not counted & dups
+
+
+def test_real_atac_softclip_mates(tmp_path, atac_run):
+	"""mates that disagree drop the fragment.
+
+	Without -r, mate 1 of A_SOFTCLIP_FRAG covers the base after the insertion
+	and is called ref, though its soft clip holds the inserted bases, so the
+	mates disagree. With -r it doesn't span the repeat, and the fragment is alt.
+	"""
+	assert A_SOFTCLIP_FRAG not in ub_rows(atac_run[1], A_INS)
+	_, tables = run_real_atac(tmp_path, '--atac', '-r', ATAC_REFERENCE)
+	assert ub_rows(tables, A_INS)[A_SOFTCLIP_FRAG] == (0, 1)

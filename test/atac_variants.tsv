@@ -1,0 +1,6 @@
+chrm	start	stop	ref	var	gene_name	trv_type
+chr12	6534761	6534761	T	G	GAPDH	snp
+chr7	5530212	5530212	C	A	ACTB	snp
+chr6	31271428	31271428	C	T	HLA-C	snp_low_mapq
+chr12	6470901	6470901	C	-	NA	deletion
+chr7	5532355	5532355	-	GCTACA	NA	insertion
