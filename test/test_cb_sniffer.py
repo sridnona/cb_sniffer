@@ -112,11 +112,6 @@ def test_normalize(ref, alt, kind, pos, var_ref, var_alt):
 
 # --- read_allele() ---------------------------------------------------------------
 
-class FakePileupRead:
-	def __init__(self, alignment, query_position):
-		self.alignment, self.query_position = alignment, query_position
-
-
 def make_read(cigar, quals=None, start=95):
 	import pysam
 	a = pysam.AlignedSegment()
@@ -124,7 +119,7 @@ def make_read(cigar, quals=None, start=95):
 	a.reference_start = start - 1
 	a.cigarstring = cigar
 	a.query_qualities = pysam.qualitystring_to_array(quals or 'F' * 14)
-	return FakePileupRead(a, 5)  # query position 5 is reference position 100
+	return a  # query position 5 is reference position 100
 
 
 @pytest.mark.parametrize('cigar,quals,expected', [
@@ -1160,3 +1155,114 @@ def test_real_atac_softclip_mates(atac_run):
 	agrees with mate 2 and the fragment counts (it used to be called ref, and the
 	fragment was dropped)"""
 	assert ub_rows(atac_run[1], A_INS)[A_SOFTCLIP_FRAG] == (0, 2)
+
+
+# --- snp_reads(): fetch + CIGAR walk matches htslib's pileup -------------------
+
+def pileup_snp_reads(v, bam, baseq, keep, ignore_overlaps):
+	"""snp_reads() as it was, with a pileup; the reference for the fetch version"""
+	n = len(v.var_ref)
+	for col in bam.pileup(v.chrm, v.pos - 1, v.pos, truncate=True, stepper='nofilter',
+						  max_depth=100000000, min_base_quality=0, ignore_overlaps=ignore_overlaps):
+		for read in col.pileups:
+			if read.is_del or read.is_refskip or not keep(read.alignment):
+				continue
+			aln, q = read.alignment, read.query_position
+			aligned = dict((r, i) for i, r in aln.get_aligned_pairs(matches_only=True))
+			if any(aligned.get(v.pos - 1 + i) != q + i for i in range(n)):
+				continue
+			if min(aln.query_qualities[q:q + n]) < baseq:
+				continue
+			allele = aln.query_sequence[q:q + n]
+			if allele in (v.var_ref, v.var_alt):
+				yield aln, 'ref' if allele == v.var_ref else 'alt'
+
+
+def random_mates(tmp_path, seed, site=300):
+	"""BAM of random read pairs around site (0-based), with deletions,
+	introns, insertions, soft clips, mismatches and tied qualities"""
+	import pysam
+	rng = random.Random(seed)
+	refseq = ''.join(rng.choice('ACGT') for _ in range(2000))
+
+	def cigar():
+		ops = [(4, rng.randint(1, 5))] if rng.random() < 0.2 else []
+		while sum(n for op, n in ops if op in (0, 1, 4)) < 60:
+			ops.append((0, rng.randint(3, 30)))
+			r = rng.random()
+			if r < 0.15:
+				ops.append((2, rng.randint(1, 3)))
+			elif r < 0.25:
+				ops.append((3, rng.randint(20, 150)))
+			elif r < 0.35:
+				ops.append((1, rng.randint(1, 3)))
+		ops.append((0, rng.randint(3, 20)))
+		if rng.random() < 0.2:
+			ops.append((4, rng.randint(1, 5)))
+		return ops
+
+	def make(name, start, flag):
+		a = pysam.AlignedSegment()
+		a.query_name, a.flag, a.reference_id, a.reference_start = name, flag, 0, start
+		a.cigartuples = cigar()
+		a.mapping_quality = 60
+		seq = list(read_from_ref(refseq, a.cigarstring, start))
+		for i in range(len(seq)):
+			if rng.random() < 0.08:
+				seq[i] = rng.choice('ACGTN')
+		a.query_sequence = ''.join(seq)
+		a.query_qualities = [rng.choice((2, 10, 20, 25, 30, 30, 37)) for _ in seq]
+		a.set_tags([('CB', 'CELL-1'), ('UB', 'UMI{}'.format(rng.randint(0, 5)))])
+		return a
+
+	reads = []
+	for i in range(300):
+		name = 'pair{}'.format(i)
+		s1 = rng.randint(site - 120, site)
+		s2 = rng.randint(s1, site + 2)
+		a, b = make(name, s1, 0), make(name, s2, 0)
+		proper = 0x2 if rng.random() < 0.9 else 0
+		a.flag = 0x1 | proper | 0x20 | 0x40
+		b.flag = 0x1 | proper | 0x10 | 0x80
+		for x, y in ((a, b), (b, a)):
+			x.next_reference_id, x.next_reference_start = 0, y.reference_start
+			x.template_length = (b.reference_end - a.reference_start) * (1 if x is a else -1)
+		reads += [a, b]
+		if rng.random() < 0.1:  # a secondary alignment with the same name
+			c = make(name, rng.randint(s1, site), (a.flag | 0x100))
+			c.next_reference_id, c.next_reference_start = 0, b.reference_start
+			reads.append(c)
+	reads.sort(key=lambda r: r.reference_start)
+	bam = str(tmp_path / 'mates{}.bam'.format(seed))
+	header = {'HD': {'VN': '1.6', 'SO': 'coordinate'}, 'SQ': [{'SN': '1', 'LN': 2000}]}
+	with pysam.AlignmentFile(bam, 'wb', header=header) as out:
+		for r in reads:
+			out.write(r)
+	pysam.index(bam)
+	return bam, refseq
+
+
+@pytest.mark.parametrize('seed', range(6))
+def test_snp_reads_match_pileup(tmp_path, seed):
+	from collections import Counter
+	pysam = pytest.importorskip('pysam')
+	path, refseq = random_mates(tmp_path, seed)
+	keep = lambda aln: True
+	results = {}
+	with pysam.AlignmentFile(path) as bam:
+		for site in (300, 301, 302):
+			for n in (1, 2, 3):
+				ref = refseq[site:site + n]
+				alt = ''.join({'A': 'C', 'C': 'G', 'G': 'T', 'T': 'A'}[c] for c in ref)
+				v = variant(ref, alt, start=site + 1)
+				for baseq in (1, 20, 31, 45):
+					for overlaps in (True, False):
+						new = Counter((a.query_name, a.flag, x) for a, x in
+									  v.snp_reads(bam, baseq, keep, ignore_overlaps=overlaps))
+						old = Counter((a.query_name, a.flag, x) for a, x in
+									  pileup_snp_reads(v, bam, baseq, keep, overlaps))
+						assert new == old, (site, n, baseq, overlaps)
+						results[site, n, baseq, overlaps] = old
+	assert all(results[k] for k in results if k[2] == 1)
+	# overlapping mates did change some calls, so that logic was tested
+	assert any(results[k] != results[k[:3] + (False,)] for k in results if k[3])
