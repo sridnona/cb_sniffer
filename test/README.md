@@ -9,7 +9,7 @@ It contains only reads overlapping the six sites in `variants.tsv` (1,476 reads,
 | `variants.tsv` | Six sites (see below), indels in dash notation |
 | `variants_vcf.tsv` | Four of the same sites written VCF-style, with padding bases. Each must give the same counts as its `variants.tsv` counterpart |
 | `variants.vcf` | The same sites as a VCF, plus a second ALT allele at 13625741, a `LowQual` record (15268954, for `--pass-only`), a record with no ID, and a symbolic `<DEL>` that should be skipped |
-| `reference.fa.gz` (+ `.fai`, `.gzi`) | Contig `1` of mm10 up to 15.27 Mb, all N except ±3 kb around each site (~70 KB). For `-r` |
+| `reference.fa.gz` (+ `.fai`, `.gzi`) | Contig `1` of mm10 up to 15.27 Mb, all N except ±3 kb around each site (~70 KB). Passed as `-r` (required) in every test |
 | `barcodes.tsv` | 246 of the 327 cell barcodes in the BAM. About every 4th barcode is left out so the barcode filter has reads to drop. |
 
 ## Sites
@@ -17,7 +17,7 @@ It contains only reads overlapping the six sites in `variants.tsv` (1,476 reads,
 | Site | Type | What it exercises |
 |------|------|-------------------|
 | `1:12904213 C>-` (Slco5a1) | 1-bp deletion in a C homopolymer | Deletion branch (reads with `is_del`) |
-| `1:13562395 ->A` (Tram1) | 1-bp insertion in an A homopolymer | Insertion branch. The aligner places the insertion inconsistently in the `AAA` run: with `-r`, 2 more reads are alt (ref/alt reads 14/12 instead of 16/10) |
+| `1:13562395 ->A` (Tram1) | 1-bp insertion in an A homopolymer | Insertion branch. The aligner places the insertion inconsistently in the `AAA` run, so left-aligning makes 2 more reads alt. One more read is aligned to the end of the run and then soft-clipped with the inserted A in the clip; realigning makes it alt (ref/alt reads 14/13; 16/10 from the CIGAR at the exact position alone) |
 | `1:13625741 T>C` (Lactb2) | SNV, ~50% VAF | SNP branch. Many spliced reads span the site (`is_refskip`) and many bases have BQ 0 |
 | `1:15268954 T>C` (Gm10566) | SNV | Includes multimapping reads with MAPQ 1 or 3, so `-mq` changes the result |
 | `1:10000001 T>G` | No coverage | Zero-depth handling (VAF 0.0) |
@@ -34,7 +34,7 @@ It contains only reads overlapping the five sites in `atac_variants.tsv` (4,486 
 |------|----------|
 | `atac.bam`, `atac.bam.bai` | Reads overlapping the test sites, made with `samtools view -M` over the sites and sorted. Every `@SQ` line is kept, and `@PG` lines were removed. Duplicates are flagged, not removed, as Cell Ranger ATAC writes them. 67 reads have no `CB` |
 | `atac_variants.tsv` | Five sites (see below), with indels in dash notation |
-| `atac_reference.fa.gz` (+ `.fai`, `.gzi`) | `chr7` up to 5.54 Mb and `chr12` up to 6.48 Mb of hg38, all N except ±3 kb around the two indels (from the UCSC REST API). For `-r` |
+| `atac_reference.fa.gz` (+ `.fai`, `.gzi`) | `chr6` up to 31.28 Mb, `chr7` up to 5.54 Mb and `chr12` up to 6.54 Mb of hg38, all N except ±3 kb around all five sites (from the UCSC REST API; ~170 KB). Passed as `-r` |
 | `atac_barcodes.tsv` | 1,053 of the 1,403 cell barcodes in the BAM, with every 4th one left out |
 
 | Site | Type | What it exercises |
@@ -42,18 +42,18 @@ It contains only reads overlapping the five sites in `atac_variants.tsv` (4,486 
 | `chr12:6534761 T>G` (GAPDH) | Het SNV | Overlapping mates: 61 fragments have both mates over the site |
 | `chr7:5530212 C>A` (ACTB) | Het SNV | A second SNV, on another chromosome |
 | `chr6:31271428 C>T` (HLA-C) | Het SNV | 46 alt fragments have MAPQ < 30, so `-mq 30` changes the result |
-| `chr12:6470901 C>-` | 1-bp deletion, not in a repeat | Deletion branch at ~1,000 non-duplicate reads; `-r` makes no difference |
-| `chr7:5532355 ->GCTACA` | 6-bp insertion, shifts 1 bp right | Many reads are soft-clipped at the insertion. Without `-r`, reads aligned only to the base after the insertion and then clipped are called ref. One fragment has a "ref" mate like this and an alt mate, so it is dropped as discordant. With `-r`, ref reads must reach one base further, which gives 5 / 3 instead of 10 / 2 |
+| `chr12:6470901 C>-` | 1-bp deletion, not in a repeat | Deletion branch at ~1,000 non-duplicate reads. Two fragments have only a read with a mismatch next to the deletion, with a base or two of evidence, so it isn't called (449 / 182 when the CIGAR alone was trusted) |
+| `chr7:5532355 ->GCTACA` | 6-bp insertion, shifts 1 bp right | Many reads are soft-clipped at the insertion, with the inserted bases in the clip. They're realigned and called alt, so every fragment is alt (10 / 10). Counting from the CIGAR alone called them ref (10 / 2), and dropped one fragment whose mates disagreed |
 
-Results with `--atac` (`UB_DEPTH / UB_ALT`, where each fragment counts once). The SNV and deletion counts match an independent pysam count of distinct non-duplicate read names per allele with a listed `CB`:
+Results with `--atac` (`UB_DEPTH / UB_ALT`, where each fragment counts once). The SNV counts match an independent pysam count of distinct non-duplicate read names per allele with a listed `CB`:
 
-| Site | default | `-mq 30` | `-bq 30` | `-r` | duplicates kept (pysam) |
-|------|---------|----------|----------|------|-------------------------|
-| GAPDH SNV | 240 / 121 | 240 / 121 | 228 / 119 | 240 / 121 | 504 / 255 |
-| ACTB SNV | 132 / 68 | 132 / 68 | 126 / 62 | 132 / 68 | 291 / 151 |
-| HLA-C SNV | 320 / 176 | 274 / 130 | 298 / 156 | 320 / 176 | 657 / 340 |
-| deletion | 449 / 182 | 449 / 182 | 449 / 182 | 449 / 182 | 1024 / 395 |
-| insertion | 10 / 2 | 10 / 2 | 10 / 2 | 5 / 3 | |
+| Site | default | `-mq 30` | `-bq 30` | duplicates kept (pysam) |
+|------|---------|----------|----------|-------------------------|
+| GAPDH SNV | 240 / 121 | 240 / 121 | 228 / 119 | 504 / 255 |
+| ACTB SNV | 132 / 68 | 132 / 68 | 126 / 62 | 291 / 151 |
+| HLA-C SNV | 320 / 176 | 274 / 130 | 298 / 156 | 657 / 340 |
+| deletion | 447 / 182 | 447 / 182 | 447 / 182 | 1024 / 395 |
+| insertion | 10 / 10 | 10 / 10 | 10 / 10 | |
 
 Each PCR duplicate has its own read name, so the last column shows that counting duplicates would roughly double every count.
 Without `--atac`, cb_sniffer stops with an error because no read has a `UB` tag.
@@ -73,14 +73,12 @@ Tests marked `xfail` document known bugs from `issues.md`. They're strict, so on
 ## Running by hand
 
 ```
-python3 cb_sniffer.py test/test.bam test/variants.tsv test/barcodes.tsv default
-python3 cb_sniffer.py -mq 10 test/test.bam test/variants.tsv test/barcodes.tsv mq10
-python3 cb_sniffer.py -bq 30 test/test.bam test/variants.tsv test/barcodes.tsv bq30
-python3 cb_sniffer.py test/test.bam test/variants_vcf.tsv test/barcodes.tsv vcf
-python3 cb_sniffer.py --pass-only test/test.bam test/variants.vcf test/barcodes.tsv vcf_pass
-python3 cb_sniffer.py -r test/reference.fa.gz test/test.bam test/variants.tsv test/barcodes.tsv ref
-python3 cb_sniffer.py --atac test/atac.bam test/atac_variants.tsv test/atac_barcodes.tsv atac
-python3 cb_sniffer.py --atac -r test/atac_reference.fa.gz test/atac.bam test/atac_variants.tsv test/atac_barcodes.tsv atac_ref
+python3 cb_sniffer.py -r test/reference.fa.gz test/test.bam test/variants.tsv test/barcodes.tsv default
+python3 cb_sniffer.py -r test/reference.fa.gz -mq 10 test/test.bam test/variants.tsv test/barcodes.tsv mq10
+python3 cb_sniffer.py -r test/reference.fa.gz -bq 30 test/test.bam test/variants.tsv test/barcodes.tsv bq30
+python3 cb_sniffer.py -r test/reference.fa.gz test/test.bam test/variants_vcf.tsv test/barcodes.tsv vcf
+python3 cb_sniffer.py -r test/reference.fa.gz --pass-only test/test.bam test/variants.vcf test/barcodes.tsv vcf_pass
+python3 cb_sniffer.py -r test/atac_reference.fa.gz --atac test/atac.bam test/atac_variants.tsv test/atac_barcodes.tsv atac
 ```
 
 Results with VCF-style/MNP support added (`UB_DEPTH / UB_ALT` from `*_AllCounts.tsv`):

@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 
+import random
+
 import pytest
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +27,8 @@ REFERENCE = os.path.join(TEST_DIR, 'reference.fa.gz')  # N except +-3 kb around 
 BARCODES = os.path.join(TEST_DIR, 'barcodes.tsv')
 
 sys.path.insert(0, REPO_DIR)
-from cb_sniffer import GenomicPosition, is_vcf, read_variants, left_align, right_align  # noqa: E402
+from cb_sniffer import (GenomicPosition, is_vcf, read_variants, left_align, right_align,  # noqa: E402
+						local_score, Haplotypes, RefWindow)
 
 DEL, INS, SNV, SNV_MQ, NOCOV, MNP = 12904213, 13562395, 13625741, 15268954, 10000001, 10066353
 # start position of each site in variants_vcf.tsv -> the same site in variants.tsv
@@ -46,8 +49,8 @@ def read_tsv(path):
 
 
 def run(tmp_path, *opts, variants=VARIANTS, prefix='out', bam=BAM, env=None):
-	"""Run cb_sniffer.py and return its three output tables, keyed by output name."""
-	cmd = [sys.executable, SCRIPT, *opts, bam, variants, BARCODES, prefix]
+	"""Run cb_sniffer.py (with -r REFERENCE) and return its three output tables, keyed by output name."""
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, *opts, bam, variants, BARCODES, prefix]
 	subprocess.run(cmd, cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL, env=env)
 	return {name: read_tsv(os.path.join(str(tmp_path), '{}_{}.tsv'.format(prefix, name)))
 			for name in ('AllCounts', 'counts_CB', 'counts_UB')}
@@ -321,12 +324,12 @@ def read_from_ref(refseq, cigar, start=80):
 	return seq
 
 
-def run_synthetic(tmp_path, reads, variant_line, refseq=None):
+def run_synthetic(tmp_path, reads, variant_line, refseq='A' * 1000):
 	"""
 	Write reads to a BAM (each its own cell and UMI, all starting at 1-based
 	position 81 on contig 1), run cb_sniffer on one variant and return its
 	AllCounts row. reads: list of (cigar, sequence or None). A None sequence
-	is all A's, or follows refseq when given; refseq is also passed as -r.
+	follows refseq (all A by default), which is also passed as -r.
 	"""
 	import pysam
 	bam = str(tmp_path / 'synthetic.bam')
@@ -336,7 +339,7 @@ def run_synthetic(tmp_path, reads, variant_line, refseq=None):
 			a = pysam.AlignedSegment()
 			a.query_name, a.cigarstring = 'read{}'.format(i), cigar
 			if seq is None:
-				seq = read_from_ref(refseq, cigar) if refseq else 'A' * a.infer_query_length()
+				seq = read_from_ref(refseq, cigar)
 			a.query_sequence = seq
 			a.reference_id, a.reference_start, a.mapping_quality = 0, 80, 255
 			a.query_qualities = pysam.qualitystring_to_array('F' * len(a.query_sequence))
@@ -345,12 +348,9 @@ def run_synthetic(tmp_path, reads, variant_line, refseq=None):
 	pysam.index(bam)
 	(tmp_path / 'bc.tsv').write_text(''.join('CELL{}-1\n'.format(i) for i in range(len(reads))))
 	(tmp_path / 'v.tsv').write_text('chrm\tstart\tstop\tref\tvar\tgene\ttype\n' + variant_line + '\n')
-	opts = []
-	if refseq:
-		(tmp_path / 'ref.fa').write_text('>1\n' + refseq + '\n')
-		pysam.faidx(str(tmp_path / 'ref.fa'))
-		opts = ['-r', 'ref.fa']
-	subprocess.run([sys.executable, SCRIPT, *opts, bam, 'v.tsv', 'bc.tsv', 'out'],
+	(tmp_path / 'ref.fa').write_text('>1\n' + refseq + '\n')
+	pysam.faidx(str(tmp_path / 'ref.fa'))
+	subprocess.run([sys.executable, SCRIPT, '-r', 'ref.fa', bam, 'v.tsv', 'bc.tsv', 'out'],
 				   cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 	return read_tsv(str(tmp_path / 'out_AllCounts.tsv'))[0]
 
@@ -372,15 +372,21 @@ def test_insertion_in_soft_clipped_read(tmp_path):
 ])
 def test_deletion_must_match(tmp_path, variant_line):
 	"""issues.md #5: only a deletion with the variant's start and length is alt"""
+	# 1-based 99-100 is AA, between C and G; deleting either A is the same deletion
 	row = run_synthetic(tmp_path, [
 		('19M1D20M', None),   # 1-bp deletion of base 100: alt
 		('19M2D20M', None),   # 2-bp deletion starting at 100: skipped
 		('18M2D20M', None),   # deletion starting at 99, covers 100: skipped
 		('40M', None),        # no deletion: ref
-		('20M1D20M', None),   # deletion at 101: doesn't span the site, skipped
-	], variant_line)
+		('20M1D20M', None),   # deletion of the G at 101: skipped
+	], variant_line, MIXED_REF)
 	assert (row['UB_DEPTH'], row['UB_ALT']) == ('2', '1')
 	assert row['CB_barcodes'] == 'CELL0-1'
+
+
+_rng = random.Random(1)
+MIXED_REF = ''.join(_rng.choice('ACGT') for _ in range(1000))
+MIXED_REF = MIXED_REF[:97] + 'CAAG' + MIXED_REF[101:]  # 1-based 98-101
 
 
 def base_at_100(bases):
@@ -441,52 +447,174 @@ def test_left_align_dinucleotide_repeat():
 	assert left_align(5, 'AC', ref) == (2, 'CA')   # same deletion, written shifted by one
 	assert right_align(2, 'CA', 2, ref) == (6, 'CA')
 	assert left_align(8, 'CA', ref) == (2, 'CA')   # insertion of CA after the repeat
-	assert left_align(4, 'AC', ref) == (4, 'AC')   # no reference: unchanged
-	assert left_align(4, 'AC', None) == (4, 'AC')
+	assert left_align(4, 'AC', ref) == (4, 'AC')   # base 3 is A, not C: can't shift
 
 
 REPEAT_REF = 'T' * 95 + 'AAAAA' + 'T' * 900  # A run at 1-based 96-100
 
 
-@pytest.mark.parametrize('use_ref,expected', [(True, ('3', '2')), (False, ('4', '1'))])
-def test_deletion_in_repeat(tmp_path, use_ref, expected):
-	"""issues.md #10: with a reference, a deletion anywhere in the run matches"""
+def test_deletion_in_repeat(tmp_path):
+	"""issues.md #10: a deletion anywhere in the run matches"""
 	row = run_synthetic(tmp_path, [
 		('15M1D24M', None),   # deletion of 96, the first A: alt
-		('19M1D20M', None),   # deletion of 100, the last A: alt only with -r
+		('19M1D20M', None),   # deletion of 100, the last A: alt
 		('40M', None),        # spans the run: ref
-		('18M', None),        # ends at 98, inside the run: ref only without -r
+		('18M', None),        # ends at 98, inside the run: neither
 		('15M2D23M', None),   # 2-bp deletion: neither
-	], '1\t96\t96\tA\t-\tg\tdeletion', REPEAT_REF if use_ref else None)
-	assert (row['UB_DEPTH'], row['UB_ALT']) == expected
+	], '1\t96\t96\tA\t-\tg\tdeletion', REPEAT_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('3', '2')
 
 
-@pytest.mark.parametrize('use_ref,expected', [(True, ('3', '2')), (False, ('3', '1'))])
-def test_insertion_in_repeat(tmp_path, use_ref, expected):
-	"""issues.md #10: with a reference, an insertion anywhere in the run matches"""
-	reads = [
+def test_insertion_in_repeat(tmp_path):
+	"""issues.md #10: an insertion anywhere in the run matches"""
+	row = run_synthetic(tmp_path, [
 		('15M1I25M', None),   # A inserted after 95 (before the run): alt
-		('20M1I20M', None),   # A inserted after 100 (end of the run): alt with -r, else ref
+		('20M1I20M', None),   # A inserted after 100 (end of the run): alt
 		('40M', None),        # ref
-	]
-	if not use_ref:
-		reads = [(c, read_from_ref(REPEAT_REF, c)) for c, _ in reads]
-	row = run_synthetic(tmp_path, reads, '1\t95\t95\t-\tA\tg\tinsertion',
-						REPEAT_REF if use_ref else None)
-	assert (row['UB_DEPTH'], row['UB_ALT']) == expected
+	], '1\t95\t95\t-\tA\tg\tinsertion', REPEAT_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('3', '2')
 
 
-def test_reference_insertion_in_repeat_real_data(tmp_path, default_run):
-	"""the test insertion is in an AAA run; two soft-clipped reads put it at the start"""
-	with_ref = run(tmp_path, '-r', REFERENCE)
-	assert read_counts(default_run['counts_UB'], INS) == (16, 10)
-	assert read_counts(with_ref['counts_UB'], INS) == (14, 12)
-	# the deletion is already left-aligned in every read
-	assert read_counts(with_ref['counts_UB'], DEL) == read_counts(default_run['counts_UB'], DEL)
-	# snp/mnp counts don't use the reference
-	for site in (SNV, SNV_MQ, NOCOV, MNP):
-		assert normalized(by_site(with_ref['AllCounts'])[site]) == \
-			normalized(by_site(default_run['AllCounts'])[site])
+def test_insertion_in_repeat_real_data(default_run):
+	"""the test insertion is in an AAA run, and two soft-clipped reads put it
+	at the start; they're alt too (only 16 / 10 reads without left-aligning).
+	One more read is aligned to the end of the run and then soft-clipped, with
+	the inserted A in the clip; realigning it makes it alt"""
+	assert read_counts(default_run['counts_UB'], INS) == (14, 13)
+
+
+# --- indels near soft clips, splices and mismatches --------------------------------
+# A read's CIGAR is used only if it's aligned without a clip, splice or mismatch
+# across the repeat the indel is in (and FLANK bases further where it's clipped or
+# spliced). Other reads are realigned to the ref and alt haplotypes
+
+
+def random_ref(seed, fixed):
+	"""1,000 random bases, with fixed: {0-based index: base or bases}"""
+	rng = random.Random(seed)
+	ref = [rng.choice('ACGT') for _ in range(1000)]
+	for i, bases in fixed.items():
+		ref[i:i + len(bases)] = bases
+	return ''.join(ref)
+
+
+# 6-bp insertion after 1-based 100, not in a repeat
+INS6 = 'TTGACA'
+INS6_REF = random_ref(2, {99: 'C', 100: 'G'})
+INS6_ALT = INS6_REF[:100] + INS6 + INS6_REF[100:]
+INS6_LINE = '1\t100\t100\t-\t' + INS6 + '\tg\tinsertion'
+
+
+@pytest.mark.parametrize('offset', range(9))
+def test_insertion_soft_clipped_at_any_offset(tmp_path, offset):
+	"""a read aligned up to the insertion, or partway into it, then soft-clipped
+	is alt; a ref read clipped at the same place is ref"""
+	cigar = '{}M{}S'.format(20 + offset, 26 - offset)
+	row = run_synthetic(tmp_path, [(cigar, INS6_ALT[80:126]), (cigar, INS6_REF[80:126])],
+						INS6_LINE, INS6_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL0-1')
+
+
+def test_insertion_soft_clipped_on_left(tmp_path):
+	"""the inserted bases are in a clip before the aligned part of the read"""
+	ref = random_ref(2, {79: 'C', 80: 'G'})
+	alt = ref[:80] + INS6 + ref[80:]
+	row = run_synthetic(tmp_path, [
+		('26S30M', alt[60:116]),   # clip holds 20 ref bases and the insertion: alt
+		('20S30M', ref[60:110]),   # clip holds ref bases: ref
+	], '1\t80\t80\t-\t' + INS6 + '\tg\tinsertion', ref)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL0-1')
+
+
+def test_tandem_duplication_6bp(tmp_path):
+	"""a 6-bp tandem duplication: the aligner can put the inserted bases anywhere
+	in the two copies, or clip them"""
+	ref = random_ref(3, {})
+	alt = ref[:100] + ref[94:100] + ref[100:]
+	row = run_synthetic(tmp_path, [
+		('20M6I20M', alt[80:126]),   # alt
+		('14M6I26M', alt[80:126]),   # alt, inserted at the start of the first copy
+		('20M26S', alt[80:126]),     # alt, clipped at the junction
+		('26M20S', alt[80:126]),     # alt, second copy aligned to the reference
+		('20M', ref[80:100]),        # ends before the junction: not counted
+		('46M', ref[80:126]),        # ref
+	], '1\t100\t100\t-\t' + ref[94:100] + '\tg\tinsertion', ref)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('5', '4')
+	assert row['CB_barcodes'] == 'CELL0-1,CELL1-1,CELL2-1,CELL3-1'
+
+
+def test_tandem_duplication_40bp(tmp_path):
+	"""a 40-bp tandem duplication of 1-based 101-140"""
+	ref = random_ref(4, {99: 'A', 100: 'C', 139: 'G', 140: 'T'})
+	alt = ref[:140] + ref[100:140] + ref[140:]
+	row = run_synthetic(tmp_path, [
+		('60M40I20M', alt[80:200]),   # alt
+		('60M60S', alt[80:200]),      # alt, clipped at the junction
+		('100M20S', alt[80:200]),     # alt, second copy aligned to the reference
+		('50M', ref[80:130]),         # ends in the first copy: not counted
+		('120M', ref[80:200]),        # ref
+	], '1\t140\t140\t-\t' + ref[100:140] + '\tg\tinsertion', ref)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('4', '3')
+	assert row['CB_barcodes'] == 'CELL0-1,CELL1-1,CELL2-1'
+
+
+def test_str_insertion(tmp_path):
+	"""a CA inserted in (CA)6 at 1-based 91-102: reads that span the repeat are
+	called, wherever the aligner puts the insertion or clips"""
+	ref = random_ref(5, {89: 'G', 90: 'CA' * 6, 102: 'T'})
+	alt = ref[:102] + 'CA' + ref[102:]
+	row = run_synthetic(tmp_path, [
+		('22M2I20M', alt[80:124]),   # alt
+		('12M2I30M', alt[80:124]),   # alt, inserted partway through the repeat
+		('22M22S', alt[80:124]),     # alt, clipped at the end of the repeat
+		('16M28S', alt[80:124]),     # alt, clipped partway through the repeat
+		('16M', ref[80:96]),         # ends in the repeat: not counted
+		('44M', ref[80:124]),        # ref
+	], '1\t102\t102\t-\tCA\tg\tinsertion', ref)
+	assert (row['UB_DEPTH'], row['UB_ALT']) == ('5', '4')
+	assert row['CB_barcodes'] == 'CELL0-1,CELL1-1,CELL2-1,CELL3-1'
+
+
+def test_spliced_reads_near_indel(tmp_path):
+	row = run_synthetic(tmp_path, [
+		('15M100N25M', None),                               # spliced across the site: skipped
+		('20M100N20M', None),                               # spliced at the site: skipped
+		('30M100N10M', None),                               # spliced 10 bases after it: ref
+		('20M6I2M100N12M', INS6_ALT[80:108] + INS6_REF[202:214]),  # alt, spliced 2 bases after it
+	], INS6_LINE, INS6_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL3-1')
+
+
+def test_deletion_aligned_as_mismatches(tmp_path):
+	"""a deletion near the end of a read can be aligned as mismatches instead;
+	the mismatches make it be realigned, and it's alt"""
+	ref = random_ref(6, {113: 'ACT'})
+	row = run_synthetic(tmp_path, [
+		('40M', ref[80:114] + ref[115:121]),   # base 115 deleted: alt
+		('40M', None),                         # ref
+	], '1\t115\t115\tC\t-\tg\tdeletion', ref)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL0-1')
+
+
+def test_local_score():
+	assert local_score('ACGT', 'ACGT') == 4
+	assert local_score('ACGT', 'TTACGTTT') == 4
+	assert local_score('ANGT', 'ACGT') == 3              # N scores 0
+	assert local_score('A' * 10 + 'C' * 10, 'A' * 10 + 'GG' + 'C' * 10) == 20 - 8  # 2-bp gap
+	assert local_score('A' * 10 + 'G' + 'A' * 10, 'A' * 21) == 20 - 4  # mismatch
+	assert local_score('', 'ACGT') == 0
+
+
+def test_haplotypes():
+	ref = RefWindow.__new__(RefWindow)
+	ref.start, ref.seq = 0, 'ACGTACGTAC' * 20
+	ref.end = len(ref.seq)
+	h = Haplotypes(ref, (100, 'TT', 0), 99, 100)   # TT inserted before base 100
+	assert h.alt == h.ref[:100 - h.start] + 'TT' + h.ref[100 - h.start:]
+	assert h.alt_index(99) == 99 - h.start and h.alt_index(100) == 102 - h.start
+	h = Haplotypes(ref, (100, 'AC', 2), 99, 102)   # 100-101 deleted
+	assert h.alt == h.ref[:100 - h.start] + h.ref[102 - h.start:]
+	assert h.alt_index(101) == 100 - h.start and h.alt_index(102) == 100 - h.start
 
 
 def test_reference_missing_chromosome_dies(tmp_path):
@@ -502,13 +630,24 @@ def test_deletion_reference_mismatch_warns(tmp_path):
 	variants.write_text('chrm\tstart\tstop\tref\tvar\tgene\ttype\n1\t12904213\t12904213\tG\t-\tg\tdel\n')
 	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
-	assert "deleted bases don't match the reference (C)" in result.stderr
+	assert "ref allele doesn't match the reference (C), counting anyway" in result.stderr
 
 
-def test_no_reference_warns_for_indels(tmp_path):
-	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, BARCODES, 'out']
+def test_snv_reference_mismatch_warns(tmp_path):
+	variants = tmp_path / 'v.tsv'
+	variants.write_text('1\t13625741\t13625741\tG\tC\tg\tsnp\n')  # ref base is T
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
-	assert 'no --reference given' in result.stderr
+	assert "ref allele doesn't match the reference (T)" in result.stderr
+	assert read_tsv(str(tmp_path / 'out_AllCounts.tsv'))  # still counted
+
+
+def test_reference_required(tmp_path):
+	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, BARCODES, 'out']
+	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+	assert result.returncode == 2
+	assert 'required: -r/--reference' in result.stderr
+	assert not list(tmp_path.glob('out_*.tsv'))
 
 
 def test_vcf_style_matches_dash(tmp_path, default_run):
@@ -526,7 +665,7 @@ def test_complex_variant_is_skipped(tmp_path):
 	lines = open(VARIANTS).read().splitlines()
 	lines.insert(2, '1\t13625741\t13625743\tTGC\tCA\tLactb2\tcomplex')
 	variants.write_text('\n'.join(lines) + '\n')
-	cmd = [sys.executable, SCRIPT, BAM, str(variants), BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
 	assert 'skipping unsupported variant' in result.stderr
 	rows = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))
@@ -536,7 +675,7 @@ def test_complex_variant_is_skipped(tmp_path):
 def run_expecting_error(tmp_path, text):
 	variants = tmp_path / 'variants.tsv'
 	variants.write_text(text)
-	cmd = [sys.executable, SCRIPT, BAM, str(variants), BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, str(variants), BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
 	assert result.returncode == 1
 	assert not list(tmp_path.glob('out_*.tsv'))  # fails before writing any output
@@ -598,7 +737,7 @@ def test_gzipped_barcodes(tmp_path, default_run):
 	gz = str(tmp_path / 'barcodes.tsv.gz')
 	with open(BARCODES, 'rb') as f, gzip.open(gz, 'wb') as out:
 		out.write(f.read())
-	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, gz, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, VARIANTS, gz, 'out']
 	subprocess.run(cmd, cwd=str(tmp_path), check=True, stdout=subprocess.DEVNULL)
 	rows = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))
 	assert [normalized(r) for r in rows] == [normalized(r) for r in default_run['AllCounts']]
@@ -657,17 +796,9 @@ def cram(tmp_path_factory):
 	return path
 
 
-def test_cram_requires_reference(tmp_path, cram):
-	cmd = [sys.executable, SCRIPT, cram, VARIANTS, BARCODES, 'out']
-	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, env=NO_REF_LOOKUP)
-	assert result.returncode == 1
-	assert 'CRAM input requires a reference FASTA' in result.stderr
-	assert not list(tmp_path.glob('out_*.tsv'))
-
-
 def test_cram_matches_bam(tmp_path, cram):
-	from_bam = run(tmp_path, '-r', REFERENCE, prefix='bam')
-	from_cram = run(tmp_path, '-r', REFERENCE, prefix='cram', bam=cram, env=NO_REF_LOOKUP)
+	from_bam = run(tmp_path, prefix='bam')
+	from_cram = run(tmp_path, prefix='cram', bam=cram, env=NO_REF_LOOKUP)
 	assert [normalized(r) for r in from_cram['AllCounts']] == [normalized(r) for r in from_bam['AllCounts']]
 	for name in ('counts_CB', 'counts_UB'):
 		key = lambda r: (r['start'], r['alt'], r['barcode'])
@@ -747,7 +878,7 @@ def test_vcf_matches_tsv(vcf_run, default_run):
 
 @pytest.mark.parametrize('fmt', ['vcf.gz', 'bcf'])
 def test_compressed_vcf_matches_plain(tmp_path, vcf_copies, vcf_run, fmt):
-	cmd = [sys.executable, SCRIPT, BAM, vcf_copies[fmt], BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, vcf_copies[fmt], BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
 	assert 'idx_find_and_load' not in result.stderr  # no htslib noise about the missing index
 	rows = read_tsv(str(tmp_path / 'out_AllCounts.tsv'))
@@ -802,11 +933,15 @@ def write_atac_bam(tmp_path, reads, cells=('CELL1-1', 'CELL2-1', 'CELL3-1')):
 	return bam
 
 
-def run_atac(tmp_path, reads, variant_line='1\t100\t100\tA\tC\tg\tsnp', opts=('--atac',)):
+def run_atac(tmp_path, reads, variant_line='1\t100\t100\tA\tC\tg\tsnp', opts=('--atac',),
+			 refseq='A' * 1000):
 	"""run on a synthetic ATAC BAM; return (CompletedProcess, AllCounts rows or None)"""
+	import pysam
 	bam = write_atac_bam(tmp_path, reads)
 	(tmp_path / 'v.tsv').write_text(variant_line + '\n')
-	result = subprocess.run([sys.executable, SCRIPT, *opts, bam, 'v.tsv', 'bc.tsv', 'out'],
+	(tmp_path / 'ref.fa').write_text('>1\n' + refseq + '\n')
+	pysam.faidx(str(tmp_path / 'ref.fa'))
+	result = subprocess.run([sys.executable, SCRIPT, '-r', 'ref.fa', *opts, bam, 'v.tsv', 'bc.tsv', 'out'],
 							cwd=str(tmp_path), capture_output=True, text=True)
 	out = tmp_path / 'out_AllCounts.tsv'
 	return result, read_tsv(str(out)) if out.exists() else None
@@ -850,11 +985,27 @@ def test_atac_counts_fragments(tmp_path):
 		'CELL1-1': ('0', '2'), 'CELL2-1': ('1', '0')}
 
 
+# all A except a C at 1-based 90 and a G at 110, so a 40-base read at 81-120
+# spans the A run with 9 bases to spare either side
+ATAC_DEL_REF = 'A' * 89 + 'C' + 'A' * 19 + 'G' + 'A' * 890
+
+
+def atac_del_read(name, cell, flag, deleted):
+	"""a read of ATAC_DEL_REF at 81-120, with base 100 deleted if deleted"""
+	seq = ATAC_DEL_REF[80:120]
+	if deleted:
+		return name, cell, '19M1D20M', seq[:19] + seq[20:], flag, None
+	return name, cell, '40M', seq, flag, None
+
+
 def test_atac_deletion_counts_fragments(tmp_path):
-	reads = (mates('fragA', 'CELL1-1', cigar='19M1D20M')    # both mates carry the deletion
-			 + mates('fragB', 'CELL2-1')                     # ref
-			 + [atac_read('dup', 'CELL3-1', flag=0x400, cigar='19M1D20M')])
-	result, rows = run_atac(tmp_path, reads, '1\t100\t100\tA\t-\tg\tdeletion')
+	pair = 0x1 | 0x2
+	reads = [atac_del_read('fragA', 'CELL1-1', pair | 0x40, True),   # both mates carry the deletion
+			 atac_del_read('fragA', 'CELL1-1', pair | 0x80, True),
+			 atac_del_read('fragB', 'CELL2-1', pair | 0x40, False),  # ref
+			 atac_del_read('fragB', 'CELL2-1', pair | 0x80, False),
+			 atac_del_read('dup', 'CELL3-1', 0x400, True)]
+	result, rows = run_atac(tmp_path, reads, '1\t100\t100\tA\t-\tg\tdeletion', refseq=ATAC_DEL_REF)
 	assert result.returncode == 0, result.stderr
 	assert (rows[0]['UB_DEPTH'], rows[0]['UB_ALT']) == ('2', '1')
 	assert rows[0]['CB:UB_barcodes'] == 'CELL1-1:fragA'
@@ -862,13 +1013,13 @@ def test_atac_deletion_counts_fragments(tmp_path):
 
 def test_atac_with_umis_warns(tmp_path, default_run):
 	"""--atac on a scRNA BAM warns; every read with a CB is counted as its own fragment"""
-	cmd = [sys.executable, SCRIPT, '--atac', BAM, VARIANTS, BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, '--atac', BAM, VARIANTS, BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
 	assert '--atac given, but reads have UB (UMI) tags' in result.stderr
 
 
 def test_rna_bam_passes_umi_check(tmp_path):
-	cmd = [sys.executable, SCRIPT, BAM, VARIANTS, BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', REFERENCE, BAM, VARIANTS, BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), check=True, capture_output=True, text=True)
 	assert 'UB (UMI) tag' not in result.stderr
 
@@ -880,7 +1031,7 @@ def test_rna_bam_passes_umi_check(tmp_path):
 ATAC_BAM = os.path.join(TEST_DIR, 'atac.bam')
 ATAC_VARIANTS = os.path.join(TEST_DIR, 'atac_variants.tsv')
 ATAC_BARCODES = os.path.join(TEST_DIR, 'atac_barcodes.tsv')
-ATAC_REFERENCE = os.path.join(TEST_DIR, 'atac_reference.fa.gz')  # N except +-3 kb around the indels
+ATAC_REFERENCE = os.path.join(TEST_DIR, 'atac_reference.fa.gz')  # N except +-3 kb around each site
 A_GAPDH, A_ACTB, A_HLAC, A_DEL, A_INS = 6534761, 5530212, 31271428, 6470901, 5532355
 # fragment GCTTGC...-1:...34820 at A_INS: mate 2 has the insertion; mate 1 is aligned one
 # base past it, then soft-clipped
@@ -889,7 +1040,7 @@ A_SOFTCLIP_FRAG = 'GCTTGCTCAATGCACT-1:A00519:269:H7FM2DRXX:1:2123:32353:34820'
 
 def run_real_atac(tmp_path, *opts, check=True):
 	"""run on atac.bam; return (CompletedProcess, output tables keyed by name, or None)"""
-	cmd = [sys.executable, SCRIPT, *opts, ATAC_BAM, ATAC_VARIANTS, ATAC_BARCODES, 'out']
+	cmd = [sys.executable, SCRIPT, '-r', ATAC_REFERENCE, *opts, ATAC_BAM, ATAC_VARIANTS, ATAC_BARCODES, 'out']
 	result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, check=check)
 	if not (tmp_path / 'out_AllCounts.tsv').exists():
 		return result, None
@@ -926,19 +1077,18 @@ def test_real_atac_no_umi_warning(atac_run):
 
 # fragments (ref + alt) / alt fragments, checked against an independent pysam count
 # of distinct non-duplicate read names per allele with a listed CB
+# Every fragment with reads at the insertion is alt once soft-clipped reads are
+# realigned. Two deletion fragments are lost compared with counting from the
+# CIGAR alone: each has one read with a mismatch next to the deletion and only a
+# base or two of evidence, so it isn't called
 REAL_ATAC_EXPECTED = {
 	(): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (320, 176),
-		 A_DEL: (449, 182), A_INS: (10, 2)},
+		 A_DEL: (447, 182), A_INS: (10, 10)},
 	# HLA-C has 46 alt fragments with MAPQ < 30
 	('-mq', '30'): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (274, 130),
-					A_DEL: (449, 182), A_INS: (10, 2)},
+					A_DEL: (447, 182), A_INS: (10, 10)},
 	('-bq', '30'): {A_GAPDH: (228, 119), A_ACTB: (126, 62), A_HLAC: (298, 156),
-					A_DEL: (449, 182), A_INS: (10, 2)},
-	# the insertion can shift one base right, so with -r a ref read must reach one
-	# base further: soft-clipped reads that stop there are no longer ref (see
-	# test_real_atac_softclip_mates)
-	('-r', ATAC_REFERENCE): {A_GAPDH: (240, 121), A_ACTB: (132, 68), A_HLAC: (320, 176),
-							 A_DEL: (449, 182), A_INS: (5, 3)},
+					A_DEL: (447, 182), A_INS: (10, 10)},
 }
 
 
@@ -978,13 +1128,9 @@ def test_real_atac_skips_duplicates(atac_run):
 	assert counted and not counted & dups
 
 
-def test_real_atac_softclip_mates(tmp_path, atac_run):
-	"""mates that disagree drop the fragment.
-
-	Without -r, mate 1 of A_SOFTCLIP_FRAG covers the base after the insertion
-	and is called ref, though its soft clip holds the inserted bases, so the
-	mates disagree. With -r it doesn't span the repeat, and the fragment is alt.
-	"""
-	assert A_SOFTCLIP_FRAG not in ub_rows(atac_run[1], A_INS)
-	_, tables = run_real_atac(tmp_path, '--atac', '-r', ATAC_REFERENCE)
-	assert ub_rows(tables, A_INS)[A_SOFTCLIP_FRAG] == (0, 1)
+def test_real_atac_softclip_mates(atac_run):
+	"""mate 1 of A_SOFTCLIP_FRAG covers the base after the insertion, but its
+	soft clip holds the inserted bases. It's realigned and called alt, so it
+	agrees with mate 2 and the fragment counts (it used to be called ref, and the
+	fragment was dropped)"""
+	assert ub_rows(atac_run[1], A_INS)[A_SOFTCLIP_FRAG] == (0, 2)
