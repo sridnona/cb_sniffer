@@ -265,13 +265,16 @@ class GenomicPosition:
 
 		A complex variant (unequal-length substitution, eg ACCT/GCGGGAAA) can
 		be aligned many ways: as mismatches plus an insertion or deletion, as
-		a deletion plus an insertion, or soft-clipped. So only reference reads
-		are called from the CIGAR, and every other read nearby is realigned.
+		a deletion plus an insertion, or soft-clipped, and the indels can be
+		moved into repeats either side of it. So only reference reads are
+		called from the CIGAR, if they match the reference across all the
+		bases an alt read could be shifted over (see complex_span()), and
+		every other read nearby is realigned.
 		"""
 		if self.kind == 'complex':
 			p, seq, ref_len = self.pos - 1, self.var_alt, len(self.var_ref)
 			variant = (p, seq, ref_len)
-			lo, hi = p - 1, p + ref_len  # ref bases flanking the substitution
+			lo, hi = complex_span(p, ref_len, seq, ref)
 			haps = Haplotypes(ref, p, ref_len, seq, lo, hi)
 		else:
 			p, seq, ref_len = self.indel_event()
@@ -471,6 +474,46 @@ def right_align(p, seq, ref_len, ref):
 		seq = seq[1:] + seq[0]
 		p += 1
 	return p, seq
+
+
+def complex_span(p, n, seq, ref):
+	"""
+	the reference bases a read must match, with no indel, to be a ref read at
+	a complex variant. An aligner can write the alt as indels moved away from
+	the substitution, into repeats either side of it (eg T>GG at the last T of
+	TTTTGGGG as a T deleted at the start of the T run and GG inserted after
+	the G run), leaving the bases at the substitution looking like ref.
+	So the span is widened until its reference bases can't be found in the
+	alt haplotype nearby: then a read with them isn't an alt read, however
+	it's aligned. It's widened on both sides, then trimmed back on each.
+	:param p: 0-based first reference base replaced
+	:param n: number of reference bases replaced
+	:param seq: bases in their place
+	:param ref: RefWindow
+	:return: (lo, hi), 0-based first and last base of the span, at least the
+	 bases either side of the substitution. Stops at the RefWindow's edges
+	"""
+	# a read anchored outside the repeats is shifted against the alt by at
+	# most the event size: copies of the span further away don't count
+	slack = n + len(seq) + FLANK
+
+	def in_alt(lo, hi):
+		lo = max(lo, ref.start)  # p is the first base of the contig
+		a, b = max(ref.start, lo - slack), min(ref.end, hi + 1 + slack)
+		alt = ref.bases(a, p - a) + seq + ref.bases(p + n, b - p - n)
+		return ref.bases(lo, hi + 1 - lo) in alt
+
+	lo, hi = p - 1, p + n
+	while in_alt(lo, hi) and (lo > ref.start or hi < ref.end - 1):
+		if lo > ref.start:
+			lo -= 1
+		if hi < ref.end - 1:
+			hi += 1
+	while lo < p - 1 and not in_alt(lo + 1, hi):
+		lo += 1
+	while hi > p + n and not in_alt(lo, hi - 1):
+		hi -= 1
+	return lo, hi
 
 
 # CIGAR op codes, as pysam gives them in cigartuples

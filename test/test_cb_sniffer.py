@@ -28,7 +28,7 @@ BARCODES = os.path.join(TEST_DIR, 'barcodes.tsv')
 
 sys.path.insert(0, REPO_DIR)
 from cb_sniffer import (GenomicPosition, is_vcf, read_variants, left_align, right_align,  # noqa: E402
-						local_score, Haplotypes, RefWindow)
+						local_score, Haplotypes, RefWindow, complex_span)
 
 DEL, INS, SNV, SNV_MQ, NOCOV, MNP = 12904213, 13562395, 13625741, 15268954, 10000001, 10066353
 # start position of each site in variants_vcf.tsv -> the same site in variants.tsv
@@ -704,6 +704,38 @@ def test_complex_variant_other_alleles_not_alt(tmp_path):
 		('20M4I24M', CPX_ALT[80:128]),                      # alt
 	], CPX_LINE, CPX_REF)
 	assert row['UB_ALT'] == '1' and row['CB_barcodes'] == 'CELL3-1'
+
+
+# complex variant at a repeat boundary: 1-based 100, the last T of 91-100 TTTTTTTTTT,
+# replaced by GG, before 101-110 GGGGGGGGGG
+RPT_REF = random_ref(3, {80: 'C' + 'A' * 9 + 'T' * 10 + 'G' * 10 + 'C'})
+RPT_ALT = RPT_REF[:99] + 'GG' + RPT_REF[100:]
+RPT_LINE = '1\t100\t100\tT\tGG\tg\tcomplex'
+
+
+@pytest.mark.parametrize('cigar', [
+	'10M1D19M2I19M',  # T deleted at the start of the T run, GG inserted after the G run
+	'19M1D10M2I19M',  # T deleted at the end of the T run, GG inserted after the G run
+	'19M1X10M1I19M',  # last T>G, one G inserted after the G run
+])
+def test_complex_variant_shifted_into_repeats(tmp_path, cigar):
+	"""an alt read whose aligner moved the change away from the substitution,
+	into the repeats either side of it, is still alt; a ref read is ref"""
+	row = run_synthetic(tmp_path, [(cigar, RPT_ALT[80:130]), ('50M', RPT_REF[80:130])],
+						RPT_LINE, RPT_REF)
+	assert (row['UB_DEPTH'], row['UB_ALT'], row['CB_barcodes']) == ('2', '1', 'CELL0-1')
+
+
+@pytest.mark.parametrize('refseq, p, n, seq, expected', [
+	(CPX_REF, 100, 4, 'GCGGGAAA', (99, 104)),  # no repeat: just the bases either side
+	(RPT_REF, 99, 1, 'GG', (90, 100)),   # last T: all of the T run, which the alt shortens
+	(RPT_REF, 90, 1, 'AA', (89, 99)),    # first T: all of the T run, after the A run
+	(RPT_REF, 90, 1, 'CC', (89, 91)),    # first T, alt matches neither run
+])
+def test_complex_span(refseq, p, n, seq, expected):
+	ref = RefWindow.__new__(RefWindow)
+	ref.start, ref.seq, ref.end = 0, refseq, len(refseq)
+	assert complex_span(p, n, seq, ref) == expected
 
 
 def test_complex_variant_real_data(tmp_path):
