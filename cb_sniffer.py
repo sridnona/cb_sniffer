@@ -91,21 +91,28 @@ class GenomicPosition:
 		"""
 		return self.kind
 
-	def read_allele(self, read, baseq):
+	def read_allele(self, aln, baseq, idx=None, quals=None):
 		"""
 		bases a read carries across a snp/mnp
+		:param idx: query index of each variant base in the read, from site_index()
+		:param quals: base quality of each variant base (overlapping mates can lower these)
 		:return: base string, or None if the read doesn't cover every base
 		without a gap or any base is below baseq
 		"""
 		n = len(self.var_alt)
-		qpos = read.query_position
-		if n > 1:
-			aligned = dict((r, q) for q, r in read.alignment.get_aligned_pairs(matches_only=True))
-			if any(aligned.get(self.pos - 1 + i) != qpos + i for i in range(n)):
-				return None
-		if min(read.alignment.query_qualities[qpos:qpos + n]) < int(baseq):
+		if idx is None:
+			idx = site_index(aln, self.pos - 1, n)
+		q = idx[0]
+		# every variant base must be aligned, at consecutive query positions
+		# (no deletion, intron or insertion inside an mnp)
+		if q is None or any(idx[i] != q + i for i in range(1, n)):
 			return None
-		return read.alignment.query_sequence[qpos:qpos + n]
+		if quals is None:
+			quals = site_quals(aln, idx)
+		if min(quals) < int(baseq):
+			return None
+		seq = aln.query_sequence
+		return seq[q:q + n] if seq else None  # no stored sequence ('*')
 
 	@classmethod
 	def from_fields(cls, chrm, start, end, ref, alt, gene, event):
@@ -174,23 +181,59 @@ class GenomicPosition:
 	def snp_reads(self, pile, baseq, keep, ignore_overlaps=True):
 		"""
 		:param keep: function, False for reads to skip before checking their allele
-		:param ignore_overlaps: where read mates overlap, let htslib keep only
-		 the higher-quality base (it zeroes the other mate's base quality)
+		:param ignore_overlaps: where read mates overlap, keep only one mate's
+		 base, the way htslib's pileup does (see MateOverlap)
 		:return: generator of (alignment, 'ref' or 'alt') for a snp/mnp
 		reads with a third allele (or N, or part of an mnp) are neither ref nor alt
+
+		Reads are fetched and each CIGAR is walked to the variant. This gives the
+		same reads as a pileup, without stepping a pileup across every base from
+		the leftmost read, which is slow where spliced reads span long introns.
 		"""
-		for pileupcolumn in pile.pileup(reference=self.chrm, start=self.pos - 1, end=self.pos,
-										truncate=True, stepper="nofilter", max_depth=100000000,
-										multiple_iterators=False,  # one pileup at a time; CRAM warns otherwise
-										min_base_quality=0, ignore_overlaps=ignore_overlaps):
-			for read in pileupcolumn.pileups:
-				if read.is_del or read.is_refskip or not keep(read.alignment):
-					continue
-				allele = self.read_allele(read, baseq)
-				if allele == self.var_ref:
-					yield read.alignment, 'ref'
-				elif allele == self.var_alt:
-					yield read.alignment, 'alt'
+		p0, n, baseq = self.pos - 1, len(self.var_ref), int(baseq)
+
+		def calls(aln, idx, quals):
+			allele = self.read_allele(aln, baseq, idx, quals)
+			if allele == self.var_ref:
+				yield aln, 'ref'
+			elif allele == self.var_alt:
+				yield aln, 'alt'
+
+		waiting = {}  # read name -> first mate, until its mate arrives
+		# the pileup was read at the first variant base only, so fetch reads
+		# overlapping that base (mnp reads ending early fail in read_allele)
+		for aln in pile.fetch(self.chrm, p0, p0 + 1):
+			if aln.is_unmapped:  # pileup skips these
+				continue
+			pair = ignore_overlaps and MateOverlap.pairable(aln)
+			kept = keep(aln)
+			# keep() ran after the pileup, so a read it drops can still lower
+			# its mate's qualities: hold on to it if it might pair
+			if not kept and not pair:
+				continue
+			idx = site_index(aln, p0, n)
+			if not pair:
+				yield from calls(aln, idx, None)
+				continue
+			read = [aln, kept, idx, site_quals(aln, idx)]
+			name = aln.query_name
+			first = waiting.pop(name, None)
+			if first is not None:
+				# second mate: settle the overlap, then call both
+				MateOverlap.tweak(first, read, p0, n)
+				for a, k, i, q in (first, read):
+					if k:
+						yield from calls(a, i, q)
+			elif MateOverlap.waits(aln):
+				# first mate: wait, since its qualities may still change
+				waiting[name] = read
+			elif kept:
+				# its mate started earlier but wasn't fetched here (or wasn't pairable)
+				yield from calls(aln, idx, read[3])
+		# mates that never turned up don't reach the site; call these as-is
+		for a, k, i, q in waiting.values():
+			if k:
+				yield from calls(a, i, q)
 
 	def indel_event(self):
 		"""
@@ -411,6 +454,13 @@ def right_align(p, seq, ref_len, ref):
 	return p, seq
 
 
+# CIGAR op codes, as pysam gives them in cigartuples
+CMATCH, CINS, CDEL, CREF_SKIP, CSOFT_CLIP, CHARD_CLIP, CPAD, CEQUAL, CDIFF = range(9)
+ALIGNED_OPS = (CMATCH, CEQUAL, CDIFF)  # M = X: a read base on a reference base
+QUERY_ONLY_OPS = (CINS, CSOFT_CLIP)  # I S: read bases only
+REF_ONLY_OPS = (CDEL, CREF_SKIP)  # D N: reference bases only
+NO_STEP_OPS = (CHARD_CLIP, CPAD)  # H P: neither
+
 # a read's CIGAR is trusted at an indel only if it's aligned, with no clip,
 # splice or mismatch, across the repeat, and this many bases further on any
 # side where the alignment stops at a clip or splice
@@ -450,31 +500,31 @@ def indel_allele(aln, lo, hi, variant, ref):
 	clean = True
 	events = []
 	for op, n in aln.cigartuples:
-		if op in (0, 2, 7, 8) and run is None:
+		if (op in ALIGNED_OPS or op == CDEL) and run is None:
 			run = [r, cut]
-		if op in (0, 7, 8):  # M = X
+		if op in ALIGNED_OPS:
 			for i in range(max(r, a), min(r + n, b + 1)):
 				if query[q + i - r] != ref.base(i):
 					clean = False
 			r += n
 			q += n
-		elif op == 1:  # I
+		elif op == CINS:
 			if a < r <= b:
 				events.append((r, query[q:q + n], 0))
 			q += n
-		elif op == 2:  # D
+		elif op == CDEL:
 			if r <= b and r + n > a:
 				events.append((r, ref.bases(r, n), n))
 			r += n
-		elif op in (3, 4, 5):  # N S H
-			if op == 3 and r <= hi and r + n > lo:
+		elif op in (CREF_SKIP, CSOFT_CLIP, CHARD_CLIP):
+			if op == CREF_SKIP and r <= hi and r + n > lo:
 				return None  # spliced across the repeat
 			if run is not None:
 				runs.append((run[0], r, run[1], True))
 			run, cut = None, True
-			if op == 3:
+			if op == CREF_SKIP:
 				r += n
-			elif op == 4:
+			elif op == CSOFT_CLIP:
 				q += n
 	if run is not None:
 		runs.append((run[0], r, run[1], False))
@@ -577,20 +627,20 @@ class Haplotypes:
 		r, q = aln.reference_start, 0
 		aligned = False
 		for op, n in aln.cigartuples:
-			if op in (0, 7, 8):  # M = X
+			if op in ALIGNED_OPS:
 				segments[-1].extend((q + i, r + i) for i in range(n))
 				r += n
 				q += n
 				aligned = True
-			elif op == 1:  # I
+			elif op == CINS:
 				segments[-1].extend((q + i, r) for i in range(n))
 				q += n
-			elif op == 2:  # D
+			elif op == CDEL:
 				r += n
-			elif op == 3:  # N
+			elif op == CREF_SKIP:
 				segments.append([])
 				r += n
-			elif op == 4:  # S
+			elif op == CSOFT_CLIP:
 				start = r if aligned else r - n
 				segments[-1].extend((q + i, start + i) for i in range(n))
 				q += n
@@ -610,6 +660,318 @@ class Haplotypes:
 		if margin <= -MIN_MARGIN:
 			return 'ref'
 		return None
+
+
+def site_index(aln, p0, n):
+	"""
+	:param p0: 0-based reference position of the first variant base
+	:param n: number of variant bases
+	:return: list of the query index aligned to each of the n reference
+	positions, None where the read has no base there (deletion, intron, or
+	the read doesn't reach it)
+	"""
+	out = [None] * n
+	end = p0 + n
+	rpos, qpos = aln.reference_start, 0
+	for op, length in aln.cigartuples:
+		if op in ALIGNED_OPS:
+			if rpos + length > p0:
+				for r in range(max(rpos, p0), min(rpos + length, end)):
+					out[r - p0] = qpos + r - rpos
+			rpos += length
+			qpos += length
+		elif op in QUERY_ONLY_OPS:
+			qpos += length
+		elif op in REF_ONLY_OPS:
+			rpos += length
+		if rpos >= end:  # past the variant; the rest of the CIGAR can't matter
+			break
+	return out
+
+
+def site_quals(aln, idx):
+	"""
+	:return: base quality at each query index in idx (None where idx is None)
+	"""
+	quals = aln.query_qualities
+	if quals is None:  # no qualities stored ('*'); htslib holds these as 255
+		return [None if i is None else 255 for i in idx]
+	return [None if i is None else quals[i] for i in idx]
+
+
+class _CigarCursor:
+	"""
+	Steps through the aligned (M/=/X) bases of a CIGAR. A port of htslib's
+	cigar_iref2iseq_set() and cigar_iref2iseq_next() (sam.c), so MateOverlap
+	visits the same bases in the same order.
+
+	set() and next() return 0 on an aligned base, -1 once past the end of
+	the read, -2 on an unknown CIGAR op. iref is relative to the read's
+	start, so callers add reference_start to compare mates.
+	"""
+	def __init__(self, cigar):
+		self.cigar = cigar
+		self.ci = 0     # current CIGAR op
+		self.icig = 0   # offset within it
+		self.iseq = 0   # query index
+		self.iref = 0   # reference offset from the read's start
+
+	def set(self, pos):
+		"""move to the first aligned base at or after reference offset pos"""
+		if pos < 0:
+			return -1
+		self.icig = self.iseq = self.iref = 0
+		cigar = self.cigar
+		while self.ci < len(cigar):
+			op, n = cigar[self.ci]
+			if op in ALIGNED_OPS:
+				pos -= n
+				if pos < 0:
+					self.icig = n + pos
+					self.iseq += self.icig
+					self.iref += self.icig
+					return 0
+				self.iseq += n
+				self.iref += n
+			elif op in QUERY_ONLY_OPS:
+				self.iseq += n
+			elif op in REF_ONLY_OPS:
+				pos = max(pos - n, 0)
+				self.iref += n
+			elif op not in NO_STEP_OPS:
+				return -2
+			self.ci += 1
+			self.icig = 0
+		self.iseq = -1
+		return -1
+
+	def next(self):
+		"""move to the next aligned base"""
+		cigar = self.cigar
+		while self.ci < len(cigar):
+			op, n = cigar[self.ci]
+			if op in ALIGNED_OPS:
+				if self.icig < n - 1:
+					self.iseq += 1
+					self.icig += 1
+					self.iref += 1
+					return 0
+			elif op in REF_ONLY_OPS:
+				self.iref += n
+			elif op in QUERY_ONLY_OPS:
+				self.iseq += n
+			elif op not in NO_STEP_OPS:
+				return -2
+			self.ci += 1
+			self.icig = -1
+		self.iseq = self.iref = -1
+		return -1
+
+	def after_deletion(self):
+		"""did the cursor just step over a deletion (htslib's catch-up check)"""
+		return self.ci > 0 and self.cigar[self.ci - 1][0] == CDEL
+
+
+class MateOverlap:
+	"""
+	Where the two mates of a pair overlap, htslib's pileup (ignore_overlaps)
+	keeps only one of them at each base, by changing base qualities: if the
+	bases agree, one mate gets the sum of both qualities (at most 200) and
+	the other gets 0; if they disagree, the better one keeps 80% of its
+	quality and the other gets 0. This repeats that for reads from fetch(),
+	following overlap_push() and tweak_overlap_quality() in htslib's sam.c,
+	so counts don't change from when cb_sniffer used a pileup.
+
+	A read is [alignment, kept, site_index(), site_quals()]; only the
+	qualities at the variant are needed, so only those are changed.
+	"""
+	@staticmethod
+	def pairable(aln):
+		"""can the read be paired with its mate (htslib overlap_push())"""
+		f = aln.flag
+		if f & 0x8 or not f & 0x2:  # mate unmapped, or not a proper pair
+			return False
+		if aln.next_reference_id >= 0 and aln.reference_id != aln.next_reference_id:
+			return False
+		end = aln.reference_start + aln.reference_length
+		return not (abs(aln.template_length) >= 2 * aln.query_length
+					and aln.next_reference_start >= end)
+
+	@staticmethod
+	def waits(aln):
+		"""
+		is the read's mate still to come: htslib only stores the read whose
+		mate starts at or after it; the later mate then finds it by name
+		"""
+		mpos = aln.next_reference_start
+		return mpos >= aln.reference_start or (aln.flag & 0x1 and mpos == -1)
+
+	@staticmethod
+	def first_keeps(name):
+		"""
+		which mate keeps the base when both agree, or tie on quality:
+		htslib picks by a hash of the read name
+		"""
+		M = 0xffffffff
+		s = name.encode()
+		h = s[0] if s else 0
+		if h:
+			for c in s[1:]:
+				h = (h * 31 + c) & M
+		h = (h + (~(h << 15) & M)) & M
+		h ^= h >> 10
+		h = (h + (h << 3)) & M
+		h ^= h >> 6
+		h = (h + (~(h << 11) & M)) & M
+		h ^= h >> 16
+		return h & 1
+
+	@staticmethod
+	def tweak(a, b, p0, n):
+		"""
+		:param a: the earlier read of the pair (changed in place)
+		:param b: the later one (changed in place)
+		"""
+		a_aln, b_aln = a[0], b[0]
+		# only qualities at the site matter, and only for reads keep() passed
+		if not (a[1] and any(i is not None for i in a[2])) and \
+				not (b[1] and any(i is not None for i in b[2])):
+			return  # neither is counted here
+		a_cig, b_cig = a_aln.cigartuples, b_aln.cigartuples
+		amul = MateOverlap.first_keeps(a_aln.query_name)
+		lo, hi = b_aln.reference_start, p0 + n - 1
+		gapped = MateOverlap._gap(a_cig, a_aln.reference_start, lo, hi) or \
+			MateOverlap._gap(b_cig, lo, lo, hi)
+		if not gapped:
+			# with no deletion or intron between the start of the overlap and
+			# the variant, both mates step through it together, so each base
+			# is compared to the other mate's base at the same position
+			if b_aln.reference_start >= a_aln.reference_start + a_aln.reference_length:
+				return  # mates don't overlap
+			a_seq, b_seq = a_aln.query_sequence, b_aln.query_sequence
+			for i in range(n):
+				qa, qb = a[2][i], b[2][i]
+				if qa is not None and qb is not None:
+					a[3][i], b[3][i] = MateOverlap._resolve(
+						a_seq[qa] == b_seq[qb], a[3][i], b[3][i], amul)
+			return
+		# otherwise a deletion shifts which bases htslib compares, and can
+		# lower bases not covered by the other mate: walk it as htslib does
+		MateOverlap._tweak_walk(a, b, p0, n, amul)
+
+	@staticmethod
+	def _gap(cigar, rpos, lo, hi):
+		"""does the read have a deletion or intron touching reference positions lo..hi"""
+		for op, length in cigar:
+			if rpos > hi:
+				return False
+			if op in REF_ONLY_OPS:
+				if rpos + length > lo:
+					return True
+				rpos += length
+			elif op in ALIGNED_OPS:
+				rpos += length
+		return False
+
+	@staticmethod
+	def _resolve(same, qa, qb, amul):
+		"""new qualities for one base covered by both mates"""
+		if same:  # agreement adds confidence, but only one mate counts it
+			q = min(qa + qb, 200)
+			return (q, 0) if amul else (0, q)
+		# bases disagree: trust the better one, at reduced quality
+		if qa > qb:
+			return int(0.8 * qa), 0
+		if qa < qb:
+			return 0, int(0.8 * qb)
+		return (int(0.8 * qa), 0) if amul else (0, int(0.8 * qb))
+
+	@staticmethod
+	def _tweak_walk(a, b, p0, n, amul):
+		"""tweak_overlap_quality() for mates with deletions or introns"""
+		a_aln, b_aln = a[0], b[0]
+		apos, bpos = a_aln.reference_start, b_aln.reference_start
+		a_seq, b_seq = a_aln.query_sequence, b_aln.query_sequence
+		a_len, b_len = a_aln.query_length, b_aln.query_length
+		last = p0 + n - 1
+		# qualities at the variant, by query index
+		aq = dict((i, q) for i, q in zip(a[2], a[3]) if i is not None)
+		bq = dict((i, q) for i, q in zip(b[2], b[3]) if i is not None)
+		def scaled(q, mul):
+			return int(0.8 * q) if mul else 0
+
+		# step both reads base by base from where b starts; iref is the next
+		# reference position to compare, and neither cursor goes back
+		A, B = _CigarCursor(a_aln.cigartuples), _CigarCursor(b_aln.cigartuples)
+		iref = bpos
+		ar = A.set(iref - apos)
+		if ar < 0:
+			return
+		br = B.set(0)
+		if br < 0:
+			return
+		while True:
+			# bring each cursor up to iref
+			while ar >= 0 and A.iref >= 0 and A.iref < iref - apos:
+				ar = A.next()
+			if ar < 0:
+				break
+			while br >= 0 and B.iref >= 0 and B.iref < iref - bpos:
+				br = B.next()
+			if br < 0:
+				break
+			if min(A.iref + apos, B.iref + bpos) > last:
+				break  # past the variant, nothing more there can change
+			iref = max(iref, A.iref + apos, B.iref + bpos) + 1
+			if A.iref + apos != B.iref + bpos:
+				# the mates landed on different positions: one skipped a gap
+				if A.iref + apos < B.iref + bpos and B.after_deletion():
+					# deletion in b: lower a's bases across it
+					while True:
+						if A.iseq in aq:
+							aq[A.iseq] = scaled(aq[A.iseq], amul)
+						ar = A.next()
+						if ar < 0:
+							break
+						if A.iref + apos >= B.iref + bpos:
+							break
+					if ar < 0:
+						break
+				elif A.after_deletion():
+					# deletion in a: lower b's bases across it
+					while True:
+						if B.iseq in bq:
+							bq[B.iseq] = scaled(bq[B.iseq], not amul)
+						br = B.next()
+						if br < 0:
+							break
+						if B.iref + bpos >= A.iref + apos:
+							break
+					if br < 0:
+						break
+				else:
+					continue  # eg an intron, htslib skips these
+			if A.iseq > a_len or B.iseq > b_len:
+				break
+			# both on the same position: resolve it, if it's a variant base
+			# (other bases' qualities are left alone, as they aren't used)
+			if A.iseq in aq or B.iseq in bq:
+				qa = aq.get(A.iseq, _full_qual(a_aln, A.iseq))
+				qb = bq.get(B.iseq, _full_qual(b_aln, B.iseq))
+				qa, qb = MateOverlap._resolve(a_seq[A.iseq] == b_seq[B.iseq], qa, qb, amul)
+				if A.iseq in aq:
+					aq[A.iseq] = qa
+				if B.iseq in bq:
+					bq[B.iseq] = qb
+		# write the tweaked site qualities back, in variant-base order
+		a[3] = [None if i is None else aq[i] for i in a[2]]
+		b[3] = [None if i is None else bq[i] for i in b[2]]
+
+
+def _full_qual(aln, i):
+	"""original base quality at query index i (255 if none stored)"""
+	quals = aln.query_qualities
+	return 255 if quals is None else quals[i]
 
 
 # reads skipped in atac mode: secondary, QC fail, duplicate
